@@ -17,10 +17,6 @@
 #include "third_party/skia/include/core/SkImageInfo.h"
 #include "third_party/skia/include/core/SkPixmap.h"
 
-#if defined(_WIN32)
-BOOL HookByHotpatch(LPCWSTR szDllName, LPCSTR szFuncName, void* pfnNew, void** pfnOld);
-#endif
-
 namespace content {
 
 namespace {
@@ -33,13 +29,49 @@ using PtrBeginPaint = HDC(WINAPI*)(HWND, PAINTSTRUCT*);
 using PtrEndPaint = BOOL(WINAPI*)(HWND, const PAINTSTRUCT*);
 using PtrIsDebuggerPresent = BOOL(WINAPI*)();
 
-PtrBeginPaint s_origBeginPaint = nullptr;
-PtrEndPaint s_origEndPaint = nullptr;
+PtrBeginPaint s_origBeginPaint = &::BeginPaint;
+PtrEndPaint s_origEndPaint = &::EndPaint;
 PtrIsDebuggerPresent s_origIsDebuggerPresent = nullptr;
 
 BOOL WINAPI hookedIsDebuggerPresent()
 {
     return FALSE;
+}
+
+BOOL hookByHotpatch(LPCWSTR dllName, LPCSTR funcName, void* newFunc, void** oldFunc)
+{
+#if defined(_M_IX86)
+    HMODULE mod = ::LoadLibraryW(dllName);
+    if (!mod)
+        return FALSE;
+    auto* pByte = reinterpret_cast<BYTE*>(::GetProcAddress(mod, funcName));
+    if (!pByte || pByte[0] != 0x8B || pByte[1] != 0xFF)
+        return FALSE;
+
+    DWORD oldProtect = 0;
+    if (!::VirtualProtect(pByte - 5, 7, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return FALSE;
+
+    if (oldFunc)
+        *oldFunc = pByte + 2;
+
+    DWORD relOffset = static_cast<DWORD>(reinterpret_cast<uintptr_t>(newFunc) - reinterpret_cast<uintptr_t>(pByte));
+    BYTE jmpLong[5] = { 0xE9, 0, 0, 0, 0 };
+    memcpy(&jmpLong[1], &relOffset, 4);
+    memcpy(pByte - 5, jmpLong, 5);
+
+    BYTE jmpShort[2] = { 0xEB, 0xF9 };
+    memcpy(pByte, jmpShort, 2);
+
+    ::VirtualProtect(pByte - 5, 7, oldProtect, &oldProtect);
+    return TRUE;
+#else
+    (void)dllName;
+    (void)funcName;
+    (void)newFunc;
+    (void)oldFunc;
+    return FALSE;
+#endif
 }
 
 void setUpOffscreenPaintingHooks(PtrBeginPaint beginPaintHook, PtrEndPaint endPaintHook)
@@ -49,9 +81,9 @@ void setUpOffscreenPaintingHooks(PtrBeginPaint beginPaintHook, PtrEndPaint endPa
         return;
     s_haveHooked = true;
 
-    HookByHotpatch(L"user32.dll", "BeginPaint", reinterpret_cast<void*>(beginPaintHook), reinterpret_cast<void**>(&s_origBeginPaint));
-    HookByHotpatch(L"user32.dll", "EndPaint", reinterpret_cast<void*>(endPaintHook), reinterpret_cast<void**>(&s_origEndPaint));
-    HookByHotpatch(L"kernel32.dll", "IsDebuggerPresent", reinterpret_cast<void*>(&hookedIsDebuggerPresent), reinterpret_cast<void**>(&s_origIsDebuggerPresent));
+    hookByHotpatch(L"user32.dll", "BeginPaint", reinterpret_cast<void*>(beginPaintHook), reinterpret_cast<void**>(&s_origBeginPaint));
+    hookByHotpatch(L"user32.dll", "EndPaint", reinterpret_cast<void*>(endPaintHook), reinterpret_cast<void**>(&s_origEndPaint));
+    hookByHotpatch(L"kernel32.dll", "IsDebuggerPresent", reinterpret_cast<void*>(&hookedIsDebuggerPresent), reinterpret_cast<void**>(&s_origIsDebuggerPresent));
 }
 
 bool registerPluginViewWindowClass()

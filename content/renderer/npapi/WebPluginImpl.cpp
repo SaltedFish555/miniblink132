@@ -513,7 +513,7 @@ NPError WebPluginImpl::getValueForURL(NPNURLVariable variable, const char* url, 
         if (!webview || !webview->getWebCookieJarImpl())
             return NPERR_GENERIC_ERROR;
 
-        std::string cookieStr = webview->getWebCookieJarImpl()->cookies(u, blink::WebURL());
+        std::string cookieStr = webview->getWebCookieJarImpl()->getCookiesForSession(u, true);
         uint32_t size = static_cast<uint32_t>(cookieStr.size());
         *value = static_cast<char*>(NPN_MemAlloc(size + 1));
         if (!*value)
