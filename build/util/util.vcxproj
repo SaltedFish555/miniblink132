@@ -1681,7 +1681,7 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <Optimization>MinSpace</Optimization>
-      <AdditionalOptions>-mno-avx %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-mno-avx -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>
@@ -1760,7 +1760,7 @@
       <FavorSizeOrSpeed>Size</FavorSizeOrSpeed>
       <OmitFramePointers>false</OmitFramePointers>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
-      <AdditionalOptions>-mno-avx </AdditionalOptions>
+      <AdditionalOptions>-mno-avx -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>

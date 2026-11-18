@@ -2291,7 +2291,7 @@ static void setup_tile(Dav1dTileState* const ts, const Dav1dFrameContext* const 
     const uint8_t* const size_mul = ss_size_mul[f->cur.p.layout];
     for (int p = 0; p < 2; p++) {
         ts->frame_thread[p].pal_idx = f->frame_thread.pal_idx ? &f->frame_thread.pal_idx[(size_t)tile_start_off * size_mul[1] / 4] : NULL;
-        ts->frame_thread[p].cf = f->frame_thread.cf ? (uint8_t*)f->frame_thread.cf + (((size_t)tile_start_off * size_mul[0]) >> !f->seq_hdr->hbd) : NULL;
+        ts->frame_thread[p].cf = f->frame_thread.cf ? (coef*)((uint8_t*)f->frame_thread.cf + (((size_t)tile_start_off * size_mul[0]) >> !f->seq_hdr->hbd)) : NULL;
     }
 
     dav1d_cdf_thread_copy(&ts->cdf, &f->in_cdf);
