@@ -291,7 +291,6 @@
     </ClCompile>
     <ClCompile Include="test\clear_mojo.cpp" />
     <ClCompile Include="test\CodeSizeView.cpp" />
-    <ClCompile Include="test\GenNapiStub.cpp" />
     <ClCompile Include="test\search_hex.cpp" />
     <ClCompile Include="test\testmain.cpp" />
     <ClCompile Include="test_gtk.cpp" />

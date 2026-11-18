@@ -1590,7 +1590,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
     <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
-    <Import Project="$(ProgramFiles) (x86)\MSBuild\Microsoft.Cpp\v4.0\V140\BuildCustomizations\nasm.props" />
+    <Import Project="$(MSBuildThisFileDirectory)..\nasm.props" />
   </ImportGroup>
   <ImportGroup Label="Shared">
   </ImportGroup>
@@ -1813,6 +1813,6 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
-    <Import Project="$(ProgramFiles) (x86)\MSBuild\Microsoft.Cpp\v4.0\V140\BuildCustomizations\nasm.targets" />
+    <Import Project="$(MSBuildThisFileDirectory)..\nasm.targets" />
   </ImportGroup>
 </Project>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <AvailableItemName Include="NASM">
+      <Targets>_NASM</Targets>
+    </AvailableItemName>
+  </ItemGroup>
+  <Target Name="_NASM"
+          BeforeTargets="ComputeCLOutputs;Lib;Link"
+          AfterTargets="CustomBuild"
+          Condition="'@(NASM)' != ''"
+          Outputs="%(NASM.ObjectFileName)"
+          Inputs="%(NASM.Identity)">
+    <ItemGroup>
+      <_NasmInc Remove="@(_NasmInc)" />
+      <_NasmInc Include="%(NASM.IncludePaths)" Condition="'%(NASM.ExcludedFromBuild)' != 'true'" />
+    </ItemGroup>
+    <MakeDir Directories="$([System.IO.Path]::GetDirectoryName('%(NASM.ObjectFileName)'))" Condition="'%(NASM.ExcludedFromBuild)' != 'true'" />
+    <Exec Condition="'%(NASM.ExcludedFromBuild)' != 'true'"
+          Command="nasm $(NasmDefaultFormat) @(_NasmInc->'-I&quot;%(FullPath)/&quot;', ' ') %(NASM.AdditionalOptions) -o &quot;%(NASM.ObjectFileName)&quot; &quot;%(NASM.Identity)&quot;" />
+    <ItemGroup>
+      <Lib Include="%(NASM.ObjectFileName)" Condition="'%(NASM.ExcludedFromBuild)' != 'true'" />
+      <Link Include="%(NASM.ObjectFileName)" Condition="'%(NASM.ExcludedFromBuild)' != 'true'" />
+    </ItemGroup>
+  </Target>
+</Project>

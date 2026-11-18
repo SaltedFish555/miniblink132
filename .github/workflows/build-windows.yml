@@ -35,12 +35,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - group: util
+            projects: "util/util.vcxproj"
           - group: third_party
-            projects: "util/util.vcxproj,icu/icu.vcxproj,harfbuzz/harfbuzz.vcxproj,openssl/openssl.vcxproj"
+            projects: "icu/icu.vcxproj,harfbuzz/harfbuzz.vcxproj,openssl/openssl.vcxproj"
           - group: skia
             projects: "skia/skia.vcxproj"
+          - group: v8_1
+            projects: "v8/v8_1.vcxproj"
           - group: v8_a
-            projects: "v8/v8_1.vcxproj,v8/v8_2.vcxproj"
+            projects: "v8/v8_2.vcxproj"
           - group: v8_b
             projects: "v8/v8_3.vcxproj.vcxproj,v8/v8_gin.vcxproj,V8_GEN"
           - group: chromium
@@ -68,6 +72,18 @@ jobs:
         if: steps.cache-libs.outputs.cache-hit != 'true'
         uses: microsoft/setup-msbuild@v2
 
+      - name: Ensure NASM is installed (for util / dav1d)
+        if: steps.cache-libs.outputs.cache-hit != 'true' && matrix.group == 'util'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if (Test-Path "C:\Program Files\NASM") {
+              echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+          nasm -v
+
       - name: Compile base static libraries (${{ matrix.group }})
         if: steps.cache-libs.outputs.cache-hit != 'true'
         shell: pwsh
@@ -75,7 +91,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $slnDir = "${env:GITHUB_WORKSPACE}\build\"
 
-          # Pick 10.0.22621.0 if installed, otherwise latest installed Windows 10/11 SDK
           $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
           $sdkVer = "10.0.22621.0"
           if (-not (Test-Path "$sdkRoot\$sdkVer")) {
@@ -83,7 +98,6 @@ jobs:
           }
           Write-Host "Using Windows SDK: $sdkVer"
 
-          # Ensure VS ClangCL is Installed; fall back to preinstalled LLVM if needed
           $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vsWhere -latest -property installationPath
           $vsLlvm = Join-Path $vsPath "VC\Tools\Llvm\x64\bin\clang-cl.exe"
@@ -117,9 +131,11 @@ jobs:
               /p:WindowsTargetPlatformVersion=$sdkVer `
               @extraProps `
               /clp:ErrorsOnly
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed on $relProj with exit code $LASTEXITCODE"
+            }
           }
 
-          # Free intermediate .obj files before cache/artifact upload
           if (Test-Path "${env:GITHUB_WORKSPACE}\out\tmp") {
             Remove-Item -Recurse -Force "${env:GITHUB_WORKSPACE}\out\tmp"
           }
@@ -142,6 +158,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Restore cached miniblink132.lib (when content/mbvip/mbnet unchanged)
+        id: cache-mblib
+        uses: actions/cache@v4
+        with:
+          path: out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/miniblink132.lib
+          key: mb132-corelib-v1-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-${{ hashFiles('content/**', 'mbvip/**', 'mbnet/**', 'build/miniblink108/miniblink108.vcxproj') }}
 
       - name: Download all base .lib slices
         uses: actions/download-artifact@v4
@@ -173,11 +196,11 @@ jobs:
             $extraProps += "/p:LLVMInstallDir=C:\Program Files\LLVM", "/p:ClangClExecutable=C:\Program Files\LLVM\bin\clang-cl.exe"
           }
 
-          $targets = @(
-            "miniblink108/miniblink108.vcxproj",
-            "maindll/maindll.vcxproj",
-            "testdll/testdll.vcxproj"
-          )
+          $targets = @()
+          if ("${{ steps.cache-mblib.outputs.cache-hit }}" -ne "true") {
+            $targets += "miniblink108/miniblink108.vcxproj"
+          }
+          $targets += "maindll/maindll.vcxproj", "testdll/testdll.vcxproj"
 
           foreach ($relProj in $targets) {
             $fullProj = Join-Path "${env:GITHUB_WORKSPACE}\build" $relProj
@@ -188,7 +211,15 @@ jobs:
               /p:Platform=${env:BUILD_PLATFORM} `
               /p:SolutionDir="$slnDir" `
               /p:WindowsTargetPlatformVersion=$sdkVer `
-              @extraProps
+              @extraProps `
+              /clp:ErrorsOnly
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed on $relProj with exit code $LASTEXITCODE"
+            }
+          }
+
+          if (Test-Path "${env:GITHUB_WORKSPACE}\out\tmp") {
+            Remove-Item -Recurse -Force "${env:GITHUB_WORKSPACE}\out\tmp"
           }
 
           Get-ChildItem "out/win_${env:BUILD_CONFIG}_${env:BUILD_PLATFORM}" | Format-Table Name, Length
