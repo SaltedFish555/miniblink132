@@ -1,0 +1,207 @@
+name: Build Miniblink132 Windows (NPAPI Flash)
+
+on:
+  push:
+    branches: [ main, feat/npapi-flash ]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target Architecture (x64 for NPSWF64.dll, Win32 for NPSWF32.dll)'
+        required: true
+        default: 'x64'
+        type: choice
+        options:
+          - x64
+          - Win32
+      configuration:
+        description: 'Build Configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+env:
+  BUILD_PLATFORM: ${{ inputs.platform || 'x64' }}
+  BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+
+jobs:
+  build-base-libs:
+    name: Base Libs (${{ matrix.group }})
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: third_party
+            projects: "util/util.vcxproj,icu/icu.vcxproj,harfbuzz/harfbuzz.vcxproj,openssl/openssl.vcxproj"
+          - group: skia
+            projects: "skia/skia.vcxproj"
+          - group: v8_a
+            projects: "v8/v8_1.vcxproj,v8/v8_2.vcxproj"
+          - group: v8_b
+            projects: "v8/v8_3.vcxproj.vcxproj,v8/v8_gin.vcxproj,V8_GEN"
+          - group: chromium
+            projects: "chromium/chromium.vcxproj"
+          - group: gen_1
+            projects: "miniblink108/gen_1.vcxproj"
+          - group: mb_platform
+            projects: "miniblink108/mb_platform.vcxproj"
+
+    steps:
+      - name: Restore cached static libraries (${{ matrix.group }})
+        id: cache-libs
+        uses: actions/cache@v4
+        with:
+          path: out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/*.lib
+          key: mb132-baselib-v1-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-${{ matrix.group }}
+
+      - name: Checkout source (only when cache misses)
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile base static libraries (${{ matrix.group }})
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $slnDir = "${env:GITHUB_WORKSPACE}\build\"
+
+          # Pick 10.0.22621.0 if installed, otherwise latest installed Windows 10/11 SDK
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $sdkVer = "10.0.22621.0"
+          if (-not (Test-Path "$sdkRoot\$sdkVer")) {
+            $sdkVer = (Get-ChildItem $sdkRoot -Directory | Where-Object { $_.Name -like "10.0.*" } | Sort-Object Name -Descending | Select-Object -First 1).Name
+          }
+          Write-Host "Using Windows SDK: $sdkVer"
+
+          # Ensure VS ClangCL is Installed; fall back to preinstalled LLVM if needed
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -property installationPath
+          $vsLlvm = Join-Path $vsPath "VC\Tools\Llvm\x64\bin\clang-cl.exe"
+          $extraProps = @()
+          if (-not (Test-Path $vsLlvm) -and (Test-Path "C:\Program Files\LLVM\bin\clang-cl.exe")) {
+            $extraProps += "/p:LLVMInstallDir=C:\Program Files\LLVM", "/p:ClangClExecutable=C:\Program Files\LLVM\bin\clang-cl.exe"
+          }
+
+          $rawList = "${{ matrix.projects }}".Split(",")
+          $projList = @()
+          foreach ($item in $rawList) {
+            if ($item -eq "V8_GEN") {
+              if ("${env:BUILD_PLATFORM}" -eq "Win32") {
+                $projList += "v8/v8_gen_x32_1.vcxproj", "v8/v8_gen_x32_2.vcxproj"
+              } else {
+                $projList += "v8/v8_gen_x64_1.vcxproj", "v8/v8_gen_x64_2.vcxproj", "v8/v8_gen_x64_3.vcxproj"
+              }
+            } else {
+              $projList += $item
+            }
+          }
+
+          foreach ($relProj in $projList) {
+            $fullProj = Join-Path "${env:GITHUB_WORKSPACE}\build" $relProj
+            Write-Host "=== Building $relProj (${env:BUILD_CONFIG}|${env:BUILD_PLATFORM}) ==="
+            msbuild $fullProj `
+              /m `
+              /p:Configuration=${env:BUILD_CONFIG} `
+              /p:Platform=${env:BUILD_PLATFORM} `
+              /p:SolutionDir="$slnDir" `
+              /p:WindowsTargetPlatformVersion=$sdkVer `
+              @extraProps `
+              /clp:ErrorsOnly
+          }
+
+          # Free intermediate .obj files before cache/artifact upload
+          if (Test-Path "${env:GITHUB_WORKSPACE}\out\tmp") {
+            Remove-Item -Recurse -Force "${env:GITHUB_WORKSPACE}\out\tmp"
+          }
+
+      - name: Upload base .lib slice (${{ matrix.group }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: baselibs-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-${{ matrix.group }}
+          path: out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/*.lib
+          if-no-files-found: error
+          retention-days: 3
+
+  link-miniblink:
+    name: Build NPAPI Flash & Link DLL/EXE
+    needs: build-base-libs
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download all base .lib slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: baselibs-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-*
+          path: out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}
+          merge-multiple: true
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile miniblink132 (with NPAPI Flash) and link DLL + wkexe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $slnDir = "${env:GITHUB_WORKSPACE}\build\"
+
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $sdkVer = "10.0.22621.0"
+          if (-not (Test-Path "$sdkRoot\$sdkVer")) {
+            $sdkVer = (Get-ChildItem $sdkRoot -Directory | Where-Object { $_.Name -like "10.0.*" } | Sort-Object Name -Descending | Select-Object -First 1).Name
+          }
+
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -property installationPath
+          $vsLlvm = Join-Path $vsPath "VC\Tools\Llvm\x64\bin\clang-cl.exe"
+          $extraProps = @()
+          if (-not (Test-Path $vsLlvm) -and (Test-Path "C:\Program Files\LLVM\bin\clang-cl.exe")) {
+            $extraProps += "/p:LLVMInstallDir=C:\Program Files\LLVM", "/p:ClangClExecutable=C:\Program Files\LLVM\bin\clang-cl.exe"
+          }
+
+          $targets = @(
+            "miniblink108/miniblink108.vcxproj",
+            "maindll/maindll.vcxproj",
+            "testdll/testdll.vcxproj"
+          )
+
+          foreach ($relProj in $targets) {
+            $fullProj = Join-Path "${env:GITHUB_WORKSPACE}\build" $relProj
+            Write-Host "=== Building $relProj (${env:BUILD_CONFIG}|${env:BUILD_PLATFORM}) ==="
+            msbuild $fullProj `
+              /m `
+              /p:Configuration=${env:BUILD_CONFIG} `
+              /p:Platform=${env:BUILD_PLATFORM} `
+              /p:SolutionDir="$slnDir" `
+              /p:WindowsTargetPlatformVersion=$sdkVer `
+              @extraProps
+          }
+
+          Get-ChildItem "out/win_${env:BUILD_CONFIG}_${env:BUILD_PLATFORM}" | Format-Table Name, Length
+
+      - name: Upload Miniblink132 Flash DLL & Demo EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniblink132-flash-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}
+          path: |
+            out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/*.dll
+            out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/*.exe
+            out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/*.pdb
+            out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/mb132_*.lib
+            mbvip/core/mb.h
+          if-no-files-found: error
+          retention-days: 30
