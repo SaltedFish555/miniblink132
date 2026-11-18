@@ -120,8 +120,15 @@ void BodyLoaderClient::DidStartLoadingResponseBody(mojo::ScopedDataPipeConsumerH
     navigationParams->policy_container = std::make_unique<blink::WebPolicyContainer>(
         blink::WebPolicyContainerPolicies(), blink::ToCrossVariantAssociatedMojoType(std::move(policyContainerRemote)));
 
-    if (m_response->MimeType().IsNull() || m_response->MimeType().IsEmpty())
-        m_response->SetMimeType(blink::WebString::FromASCII("text/html")); // ÓĞµÄÍøÕ¾£¬±ÈÈçhttps://mofang.163.com/ÏÂÃæµÄ£¬Ã»Õâ¸ö×Ö¶Î
+    if (m_response->MimeType().IsNull() || m_response->MimeType().IsEmpty()) {
+        WTF::String pathLower = url.GetPath().ToString().LowerASCII();
+        if (pathLower.EndsWith(".swf"))
+            m_response->SetMimeType(blink::WebString::FromASCII("application/x-shockwave-flash"));
+        else if (pathLower.EndsWith(".spl"))
+            m_response->SetMimeType(blink::WebString::FromASCII("application/futuresplash"));
+        else
+            m_response->SetMimeType(blink::WebString::FromASCII("text/html")); // æœ‰çš„ç½‘ç«™ï¼Œæ¯”å¦‚https://mofang.163.com/ä¸‹é¢çš„ï¼Œæ²¡è¿™ä¸ªå­—æ®µ
+    }
 
     ::network::mojom::URLResponseHeadPtr urlResponseHead = ::network::mojom::URLResponseHead::New();
     //urlResponseHead->headers;
@@ -132,7 +139,7 @@ void BodyLoaderClient::DidStartLoadingResponseBody(mojo::ScopedDataPipeConsumerH
     urlResponseHead->encoded_body_length = network::mojom::EncodedBodyLength::New(m_response->ExpectedContentLength());
 
     CHECK(!m_urlLoaderImpl);
-    m_urlLoaderImpl.reset(new URLLoaderImpl(this)); // TODO: ÄÚ´æĞ¹Â¶
+    m_urlLoaderImpl.reset(new URLLoaderImpl(this)); // TODO: å†…å­˜æ³„éœ²
 
     ::network::mojom::URLLoaderClientEndpointsPtr urlLoaderClientEndpoints = ::network::mojom::URLLoaderClientEndpoints::New(
         m_urlLoaderImpl->m_urlLoader.BindNewPipeAndPassRemote(), m_urlLoaderImpl->m_urlLoaderClient.BindNewPipeAndPassReceiver());
@@ -157,7 +164,7 @@ void BodyLoaderClient::DidStartLoadingResponseBody(mojo::ScopedDataPipeConsumerH
         navigationControl->CommitNavigation(std::move(navigationParams), nullptr);
 }
 
-// ±¾º¯ÊıÒ»°ã´ÓhandleDataURL´«À´¡£²âÊÔ°¸Àı£º
+// æœ¬å‡½æ•°ä¸€èˆ¬ä»handleDataURLä¼ æ¥ã€‚æµ‹è¯•æ¡ˆä¾‹ï¼š
 // var iframe = document.createElement('iframe');
 // iframe.src = "data:text/html;charset=utf-8,<!DOCTYPE html><script>parent.postMessage(document.contentType,'*')<\/script>";
 void BodyLoaderClient::DidReceiveDataForTesting(base::span<const char> data)

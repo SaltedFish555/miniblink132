@@ -14,7 +14,8 @@
 #include "base/memory/scoped_refptr.h"
 #include "base/timer/timer.h"
 #include "content/renderer/npapi/PluginQuirkSet.h"
-#include "mojo/public/cpp/system/data_pipe_drainer.h"
+#include "mojo/public/cpp/system/data_pipe.h"
+#include "mojo/public/cpp/system/simple_watcher.h"
 #include "services/network/public/cpp/resource_request.h"
 #include "third_party/blink/public/platform/web_url_error.h"
 #include "third_party/blink/public/platform/web_url_response.h"
@@ -45,8 +46,7 @@ public:
 };
 
 class PluginStream : public base::RefCounted<PluginStream>,
-                     public blink::URLLoaderClient,
-                     public mojo::DataPipeDrainer::Client {
+                     public blink::URLLoaderClient {
 public:
     static scoped_refptr<PluginStream> create(PluginStreamClient* client, int64_t mbwebviewId,
         std::unique_ptr<network::ResourceRequest> request, scoped_refptr<const blink::SecurityOrigin> topFrameOrigin,
@@ -76,10 +76,6 @@ public:
     void DidFail(const blink::WebURLError& error, base::TimeTicks finishTime,
         int64_t totalEncodedDataLength, uint64_t totalEncodedBodyLength, int64_t totalDecodedBodyLength) override;
 
-    // mojo::DataPipeDrainer::Client
-    void OnDataAvailable(base::span<const uint8_t> data) override;
-    void OnDataComplete() override;
-
     static NPP ownerForStream(NPStream* stream);
 
 private:
@@ -95,7 +91,8 @@ private:
     void destroyStream(NPReason reason);
     void destroyStreamImpl();
     void setDefersLoading(bool defers);
-    void finishAsyncLoadIfReady();
+    void onBodyPipeReadable(MojoResult result);
+    void drainBodyPipe();
 
     PluginStreamClient* m_client = nullptr;
     int64_t m_mbwebviewId = 0;
@@ -106,16 +103,13 @@ private:
 
     blink::WebURLResponse m_resourceResponse;
     std::unique_ptr<mbnet::WebURLLoaderImplCurl> m_loader;
-    std::unique_ptr<mojo::DataPipeDrainer> m_drainer;
+    mojo::ScopedDataPipeConsumerHandle m_bodyPipe;
+    std::unique_ptr<mojo::SimpleWatcher> m_bodyWatcher;
 
     void* m_notifyData = nullptr;
     bool m_sendNotification = false;
     PluginStreamState m_streamState = StreamBeforeStarted;
     bool m_loadManually = false;
-
-    bool m_dataPipeActive = false;
-    bool m_dataPipeFinished = false;
-    bool m_loaderFinished = false;
 
     std::vector<char> m_deliveryData;
     base::OneShotTimer m_delayDeliveryTimer;

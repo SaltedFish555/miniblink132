@@ -11,6 +11,7 @@
 #include "content/renderer/npapi/PluginDatabase.h"
 #include "content/renderer/npapi/npruntime_priv.h"
 #include <string.h>
+#include <wchar.h>
 
 #if defined(_WIN32)
 #include <shlwapi.h>
@@ -22,19 +23,102 @@ namespace content {
 namespace {
 
 #if defined(_WIN32)
-WTF::String getVersionInfoField(const LPVOID versionInfoData, const std::wstring& info)
+struct LangAndCodePage {
+    WORD language;
+    WORD codePage;
+};
+
+bool isMatchingCurrentArchitecture(const std::wstring& widePath)
+{
+    HANDLE hFile = ::CreateFileW(widePath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    BYTE headerBuf[4096] = { 0 };
+    DWORD bytesRead = 0;
+    BOOL ok = ::ReadFile(hFile, headerBuf, sizeof(headerBuf), &bytesRead, nullptr);
+    ::CloseHandle(hFile);
+    if (!ok || bytesRead < sizeof(IMAGE_DOS_HEADER))
+        return false;
+
+    const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(headerBuf);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE || dosHeader->e_lfanew <= 0)
+        return false;
+
+    DWORD peOffset = static_cast<DWORD>(dosHeader->e_lfanew);
+    if (peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > bytesRead)
+        return true; // Header beyond 4KB (unusual), allow LoadLibraryExW to decide
+
+    const DWORD peSig = *reinterpret_cast<const DWORD*>(headerBuf + peOffset);
+    if (peSig != IMAGE_NT_SIGNATURE)
+        return false;
+
+    const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(headerBuf + peOffset + sizeof(DWORD));
+#if defined(_M_X64) || defined(__x86_64__)
+    return fileHeader->Machine == IMAGE_FILE_MACHINE_AMD64;
+#elif defined(_M_IX86) || defined(__i386__)
+    return fileHeader->Machine == IMAGE_FILE_MACHINE_I386;
+#else
+    return true;
+#endif
+}
+
+WTF::String querySingleVersionField(const LPVOID versionInfoData, const std::wstring& prefix, const std::wstring& info)
 {
     LPVOID buffer = nullptr;
     UINT bufferLength = 0;
-    std::wstring subInfo = L"\\StringFileInfo\\040904E4\\" + info;
-    BOOL retval = ::VerQueryValueW(versionInfoData, subInfo.c_str(), &buffer, &bufferLength);
-    if (!retval || bufferLength == 0) {
-        subInfo = L"\\StringFileInfo\\080404b0\\" + info;
-        retval = ::VerQueryValueW(versionInfoData, subInfo.c_str(), &buffer, &bufferLength);
-        if (!retval || bufferLength == 0)
-            return WTF::String();
+    std::wstring subInfo = L"\\StringFileInfo\\" + prefix + L"\\" + info;
+    if (::VerQueryValueW(versionInfoData, subInfo.c_str(), &buffer, &bufferLength) && buffer && bufferLength > 0) {
+        size_t len = bufferLength;
+        const auto* chars = reinterpret_cast<const UChar*>(buffer);
+        while (len > 0 && chars[len - 1] == 0)
+            --len;
+        if (len > 0)
+            return WTF::String(chars, static_cast<unsigned>(len));
     }
-    return WTF::String(reinterpret_cast<const UChar*>(buffer), bufferLength - 1);
+    return WTF::String();
+}
+
+WTF::String getVersionInfoField(const LPVOID versionInfoData, const std::wstring& info)
+{
+    LangAndCodePage* trans = nullptr;
+    UINT transBytes = 0;
+    if (::VerQueryValueW(versionInfoData, L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&trans), &transBytes)
+        && trans && transBytes >= sizeof(LangAndCodePage)) {
+        size_t count = transBytes / sizeof(LangAndCodePage);
+        for (size_t i = 0; i < count; ++i) {
+            wchar_t hexLower[16] = { 0 };
+            swprintf_s(hexLower, L"%04x%04x", trans[i].language, trans[i].codePage);
+            WTF::String val = querySingleVersionField(versionInfoData, hexLower, info);
+            if (!val.empty())
+                return val;
+
+            wchar_t hexUpper[16] = { 0 };
+            swprintf_s(hexUpper, L"%04X%04X", trans[i].language, trans[i].codePage);
+            val = querySingleVersionField(versionInfoData, hexUpper, info);
+            if (!val.empty())
+                return val;
+        }
+    }
+
+    static const wchar_t* kFallbackPrefixes[] = {
+        L"040904E4",
+        L"040904b0",
+        L"040904B0",
+        L"080404b0",
+        L"080404B0",
+        L"04090000",
+        L"000004b0",
+        L"000004B0",
+        L"000004E4",
+    };
+    for (const wchar_t* prefix : kFallbackPrefixes) {
+        WTF::String val = querySingleVersionField(versionInfoData, prefix, info);
+        if (!val.empty())
+            return val;
+    }
+    return WTF::String();
 }
 #endif
 
@@ -178,44 +262,69 @@ bool PluginPackage::fetchInfo()
 {
 #if defined(_WIN32)
     std::wstring widePath = base::UTF8ToWide(m_path.Utf8());
-    DWORD zeroHandle = 0;
-    DWORD versionInfoSize = ::GetFileVersionInfoSizeW(widePath.c_str(), &zeroHandle);
-    if (versionInfoSize == 0)
-        return false;
-
-    std::vector<char> versionInfoData(versionInfoSize * 2);
-    if (!::GetFileVersionInfoW(widePath.c_str(), 0, versionInfoSize, versionInfoData.data()))
-        return false;
-
-    m_name = getVersionInfoField(versionInfoData.data(), L"ProductName");
-    m_description = getVersionInfoField(versionInfoData.data(), L"FileDescription");
-    if (m_name.IsNull() || m_description.IsNull())
-        return false;
-
-    VS_FIXEDFILEINFO* info = nullptr;
-    UINT infoSize = 0;
-    if (!::VerQueryValueW(versionInfoData.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &infoSize)
-        || infoSize < sizeof(VS_FIXEDFILEINFO)) {
+    if (!isMatchingCurrentArchitecture(widePath)) {
+        std::string msg = "[NPAPI] Skipping wrong-architecture plugin DLL: " + m_path.Utf8() + "\n";
+        ::OutputDebugStringA(msg.c_str());
         return false;
     }
-    m_moduleVersion.leastSig = info->dwFileVersionLS;
-    m_moduleVersion.mostSig = info->dwFileVersionMS;
+
+    std::string lowerFile = base::ToLowerASCII(m_fileName.Utf8());
+    bool isLikelyFlashDll = base::StartsWith(lowerFile, "npswf", base::CompareCase::SENSITIVE)
+        || (lowerFile.find("flash") != std::string::npos && !base::StartsWith(lowerFile, "pepflash", base::CompareCase::SENSITIVE));
+
+    DWORD zeroHandle = 0;
+    DWORD versionInfoSize = ::GetFileVersionInfoSizeW(widePath.c_str(), &zeroHandle);
+    std::vector<std::string> types;
+    std::vector<std::string> extensionLists;
+    std::vector<std::string> descriptions;
+
+    if (versionInfoSize > 0) {
+        std::vector<char> versionInfoData(versionInfoSize * 2);
+        if (::GetFileVersionInfoW(widePath.c_str(), 0, versionInfoSize, versionInfoData.data())) {
+            m_name = getVersionInfoField(versionInfoData.data(), L"ProductName");
+            m_description = getVersionInfoField(versionInfoData.data(), L"FileDescription");
+
+            VS_FIXEDFILEINFO* info = nullptr;
+            UINT infoSize = 0;
+            if (::VerQueryValueW(versionInfoData.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &infoSize)
+                && info && infoSize >= sizeof(VS_FIXEDFILEINFO)) {
+                m_moduleVersion.leastSig = info->dwFileVersionLS;
+                m_moduleVersion.mostSig = info->dwFileVersionMS;
+            }
+
+            types = base::SplitString(
+                getVersionInfoField(versionInfoData.data(), L"MIMEType").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+            extensionLists = base::SplitString(
+                getVersionInfoField(versionInfoData.data(), L"FileExtents").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
+            descriptions = base::SplitString(
+                getVersionInfoField(versionInfoData.data(), L"FileOpenName").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
+        }
+    }
+
+    if (types.empty() && isLikelyFlashDll) {
+        if (m_moduleVersion.mostSig == 0 && m_moduleVersion.leastSig == 0) {
+            m_moduleVersion.mostSig = 0x00220000; // 34.0
+            m_moduleVersion.leastSig = 0;
+        }
+        m_name = "Shockwave Flash";
+        m_description = "Shockwave Flash 34.0 r0";
+        types = { "application/x-shockwave-flash", "application/futuresplash" };
+        extensionLists = { "swf", "spl" };
+        descriptions = { "Adobe Flash movie", "FutureSplash movie" };
+    }
+
+    if (m_name.empty() || m_description.empty() || types.empty())
+        return false;
 
     if (isPluginBlacklisted())
         return false;
 
-    std::vector<std::string> types = base::SplitString(
-        getVersionInfoField(versionInfoData.data(), L"MIMEType").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
-    std::vector<std::string> extensionLists = base::SplitString(
-        getVersionInfoField(versionInfoData.data(), L"FileExtents").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
-    std::vector<std::string> descriptions = base::SplitString(
-        getVersionInfoField(versionInfoData.data(), L"FileOpenName").Utf8(), "|", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
-
-    if (types.empty())
-        return false;
-
+    bool supportsFlashMime = false;
     for (size_t i = 0; i < types.size(); ++i) {
         std::string type = base::ToLowerASCII(types[i]);
+        if (type == "application/x-shockwave-flash")
+            supportsFlashMime = true;
+
         std::string desc = i < descriptions.size() ? descriptions[i] : "";
         std::string extList = i < extensionLists.size() ? extensionLists[i] : "";
 
@@ -225,6 +334,10 @@ bool PluginPackage::fetchInfo()
                 ext.erase(0, 1);
             ext = base::ToLowerASCII(ext);
         }
+        if (type == "application/x-shockwave-flash" && exts.empty())
+            exts.push_back("swf");
+        else if (type == "application/futuresplash" && exts.empty())
+            exts.push_back("spl");
 
         size_t pos = desc.find("(*");
         if (pos != std::string::npos) {
@@ -237,6 +350,23 @@ bool PluginPackage::fetchInfo()
         m_mimeToExtensions[type] = exts;
         m_mimeToDescriptions[type] = WTF::String::FromUTF8(desc);
     }
+
+    // Ensure SWFObject / 4399 / Seer navigator.plugins["Shockwave Flash"] detection always succeeds.
+    if (supportsFlashMime) {
+        m_name = "Shockwave Flash";
+        std::string descUtf8 = m_description.Utf8();
+        if (!base::StartsWith(descUtf8, "Shockwave Flash ", base::CompareCase::SENSITIVE)) {
+            unsigned majorVer = HIWORD(m_moduleVersion.mostSig);
+            unsigned minorVer = LOWORD(m_moduleVersion.mostSig);
+            if (majorVer == 0)
+                majorVer = 34;
+            std::string normalizedDesc = "Shockwave Flash " + std::to_string(majorVer) + "." + std::to_string(minorVer) + " r0";
+            m_description = WTF::String::FromUTF8(normalizedDesc);
+        }
+    }
+
+    std::string okMsg = "[NPAPI] Registered plugin: " + m_name.Utf8() + " (" + m_description.Utf8() + ") -> " + m_path.Utf8() + "\n";
+    ::OutputDebugStringA(okMsg.c_str());
     return true;
 #else
     return false;

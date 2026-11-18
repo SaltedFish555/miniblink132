@@ -122,8 +122,117 @@ WebPluginImpl::~WebPluginImpl()
 bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
 {
     m_pluginContainer = container;
-    if (m_pluginContainer)
+    if (m_pluginContainer) {
         m_pluginContainer->SetWantsWheelEvents(true);
+
+        // Chromium 132 removed <param> child element collection from HTMLObjectElement::ParametersForPlugin.
+        // Recover <param name="..." value="..."> children (flashvars, movie/src, allowScriptAccess, wmode, base, etc.) here.
+        blink::WebElement element = m_pluginContainer->GetElement();
+        if (!element.IsNull()) {
+            std::vector<blink::WebString> mergedNames;
+            std::vector<blink::WebString> mergedValues;
+            for (int i = 0; i < m_paramCount; ++i) {
+                mergedNames.push_back(blink::WebString::FromUTF8(m_paramNames[i]));
+                mergedValues.push_back(blink::WebString::FromUTF8(m_paramValues[i]));
+            }
+
+            std::string codebaseParam;
+            std::string urlFromParam;
+            bool foundChildParam = false;
+
+            for (blink::WebNode child = element.FirstChild(); !child.IsNull(); child = child.NextSibling()) {
+                if (!child.IsElementNode())
+                    continue;
+                blink::WebElement paramElem = child.To<blink::WebElement>();
+                if (!paramElem.HasHTMLTagName("param"))
+                    continue;
+
+                blink::WebString rawName = paramElem.GetAttribute("name");
+                if (rawName.IsEmpty())
+                    continue;
+                blink::WebString rawVal = paramElem.GetAttribute("value");
+                std::string nameUtf8 = rawName.Utf8();
+                std::string valUtf8 = rawVal.Utf8();
+                foundChildParam = true;
+
+                if (base::EqualsCaseInsensitiveASCII(nameUtf8, "codebase") && !valUtf8.empty()) {
+                    codebaseParam = valUtf8;
+                } else if (urlFromParam.empty()
+                    && (base::EqualsCaseInsensitiveASCII(nameUtf8, "movie")
+                        || base::EqualsCaseInsensitiveASCII(nameUtf8, "src")
+                        || base::EqualsCaseInsensitiveASCII(nameUtf8, "data")
+                        || base::EqualsCaseInsensitiveASCII(nameUtf8, "code"))
+                    && !valUtf8.empty()) {
+                    urlFromParam = valUtf8;
+                }
+
+                if (base::EqualsCaseInsensitiveASCII(nameUtf8, "wmode")) {
+                    if (!base::EqualsCaseInsensitiveASCII(valUtf8, "opaque")
+                        && !base::EqualsCaseInsensitiveASCII(valUtf8, "transparent")) {
+                        rawVal = blink::WebString::FromASCII("transparent");
+                    }
+                    bool updatedWmode = false;
+                    for (size_t idx = 0; idx < mergedNames.size(); ++idx) {
+                        if (base::EqualsCaseInsensitiveASCII(mergedNames[idx].Utf8(), "wmode")) {
+                            mergedValues[idx] = rawVal;
+                            updatedWmode = true;
+                            break;
+                        }
+                    }
+                    if (!updatedWmode) {
+                        mergedNames.push_back(rawName);
+                        mergedValues.push_back(rawVal);
+                    }
+                    continue;
+                }
+
+                bool exists = false;
+                for (size_t idx = 0; idx < mergedNames.size(); ++idx) {
+                    if (base::EqualsCaseInsensitiveASCII(mergedNames[idx].Utf8(), nameUtf8)) {
+                        mergedValues[idx] = rawVal;
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    mergedNames.push_back(rawName);
+                    mergedValues.push_back(rawVal);
+                }
+            }
+
+            if (foundChildParam) {
+                freeStringArray(m_paramNames, m_paramCount);
+                freeStringArray(m_paramValues, m_paramCount);
+                m_paramNames = nullptr;
+                m_paramValues = nullptr;
+                m_paramCount = 0;
+                setParameters(blink::WebVector<blink::WebString>(mergedNames), blink::WebVector<blink::WebString>(mergedValues));
+            }
+
+            if (m_url.IsEmpty() && !urlFromParam.empty() && m_webFrame) {
+                blink::KURL baseKurl = m_webFrame->GetDocument().BaseURL();
+                if (!codebaseParam.empty()) {
+                    blink::KURL candidateBase(baseKurl, WTF::String::FromUTF8(codebaseParam));
+                    if (candidateBase.IsValid())
+                        baseKurl = candidateBase;
+                }
+                m_url = blink::KURL(baseKurl, WTF::String::FromUTF8(urlFromParam));
+            }
+
+            if (!m_plugin && m_webFrame) {
+                m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
+                if (!m_plugin && PluginDatabase::installedPlugins()->refresh())
+                    m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
+                if (m_plugin && !m_instance) {
+                    m_instance = new NPP_t();
+                    m_instance->ndata = this;
+                    m_instance->pdata = nullptr;
+                    instanceMap()[m_instance] = this;
+                    m_status = PluginStatusLoadedSuccessfully;
+                }
+            }
+        }
+    }
     init();
     return true;
 }

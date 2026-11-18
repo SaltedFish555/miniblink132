@@ -110,7 +110,11 @@ void PluginStream::stop()
 {
     m_streamState = StreamStopped;
     m_delayDeliveryTimer.Stop();
-    m_drainer.reset();
+    if (m_bodyWatcher) {
+        m_bodyWatcher->Cancel();
+        m_bodyWatcher.reset();
+    }
+    m_bodyPipe.reset();
     m_loader.reset();
     m_client = nullptr;
 }
@@ -361,7 +365,11 @@ void PluginStream::didFinishLoadingManual()
 {
     scoped_refptr<PluginStream> protect(this);
     destroyStream(NPRES_DONE);
-    m_drainer.reset();
+    if (m_bodyWatcher) {
+        m_bodyWatcher->Cancel();
+        m_bodyWatcher.reset();
+    }
+    m_bodyPipe.reset();
     m_loader.reset();
 }
 
@@ -369,7 +377,11 @@ void PluginStream::didFailManual(const blink::WebURLError&)
 {
     scoped_refptr<PluginStream> protect(this);
     destroyStream(NPRES_NETWORK_ERR);
-    m_drainer.reset();
+    if (m_bodyWatcher) {
+        m_bodyWatcher->Cancel();
+        m_bodyWatcher.reset();
+    }
+    m_bodyPipe.reset();
     m_loader.reset();
 }
 
@@ -383,8 +395,14 @@ void PluginStream::DidReceiveResponse(const blink::WebURLResponse& response,
 
     if (auto* pipe = absl::get_if<mojo::ScopedDataPipeConsumerHandle>(&body)) {
         if (pipe->is_valid()) {
-            m_dataPipeActive = true;
-            m_drainer = std::make_unique<mojo::DataPipeDrainer>(this, std::move(*pipe));
+            m_bodyPipe = std::move(*pipe);
+            drainBodyPipe();
+            if (m_streamState != StreamStopped && m_bodyPipe.is_valid()) {
+                m_bodyWatcher = std::make_unique<mojo::SimpleWatcher>(
+                    FROM_HERE, mojo::SimpleWatcher::ArmingPolicy::AUTOMATIC, base::SingleThreadTaskRunner::GetCurrentDefault());
+                m_bodyWatcher->Watch(m_bodyPipe.get(), MOJO_HANDLE_SIGNAL_READABLE | MOJO_HANDLE_SIGNAL_PEER_CLOSED,
+                    base::BindRepeating(&PluginStream::onBodyPipeReadable, base::Unretained(this)));
+            }
         }
     } else if (auto* segBuf = absl::get_if<WTF::SegmentedBuffer>(&body)) {
         for (const auto& span : *segBuf) {
@@ -400,30 +418,46 @@ void PluginStream::DidReceiveDataForTesting(base::span<const char> data)
     didReceiveDataManual(data);
 }
 
-void PluginStream::OnDataAvailable(base::span<const uint8_t> data)
+void PluginStream::onBodyPipeReadable(MojoResult)
 {
-    didReceiveDataManual(base::span<const char>(reinterpret_cast<const char*>(data.data()), data.size()));
+    drainBodyPipe();
 }
 
-void PluginStream::OnDataComplete()
+void PluginStream::drainBodyPipe()
 {
-    m_dataPipeFinished = true;
-    finishAsyncLoadIfReady();
+    if (!m_bodyPipe.is_valid() || m_streamState == StreamStopped)
+        return;
+
+    scoped_refptr<PluginStream> protect(this);
+    while (m_bodyPipe.is_valid() && m_streamState != StreamStopped) {
+        base::span<const uint8_t> buffer;
+        MojoResult rv = m_bodyPipe->BeginReadData(MOJO_READ_DATA_FLAG_NONE, buffer);
+        if (rv == MOJO_RESULT_OK) {
+            size_t numBytes = buffer.size();
+            if (numBytes > 0) {
+                didReceiveDataManual(base::span<const char>(reinterpret_cast<const char*>(buffer.data()), numBytes));
+            }
+            if (m_bodyPipe.is_valid())
+                m_bodyPipe->EndReadData(numBytes);
+        } else if (rv == MOJO_RESULT_FAILED_PRECONDITION) {
+            if (m_bodyWatcher) {
+                m_bodyWatcher->Cancel();
+                m_bodyWatcher.reset();
+            }
+            m_bodyPipe.reset();
+            break;
+        } else {
+            break;
+        }
+    }
 }
 
 void PluginStream::DidFinishLoading(base::TimeTicks, int64_t, uint64_t, int64_t)
 {
-    m_loaderFinished = true;
-    finishAsyncLoadIfReady();
-}
-
-void PluginStream::finishAsyncLoadIfReady()
-{
-    if (!m_loaderFinished)
-        return;
-    if (m_dataPipeActive && !m_dataPipeFinished)
-        return;
-    didFinishLoadingManual();
+    scoped_refptr<PluginStream> protect(this);
+    drainBodyPipe();
+    if (m_streamState != StreamStopped)
+        didFinishLoadingManual();
 }
 
 void PluginStream::DidFail(const blink::WebURLError& error, base::TimeTicks, int64_t, uint64_t, int64_t)

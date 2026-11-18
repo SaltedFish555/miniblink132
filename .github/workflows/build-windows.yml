@@ -164,7 +164,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: out/win_${{ env.BUILD_CONFIG }}_${{ env.BUILD_PLATFORM }}/miniblink132.lib
-          key: mb132-corelib-v1-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-${{ hashFiles('content/**', 'mbvip/**', 'mbnet/**', 'build/miniblink108/miniblink108.vcxproj') }}
+          key: mb132-corelib-v1-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIG }}-${{ hashFiles('content/**', 'mbvip/**', 'mbnet/**', 'mojo/public/cpp/mojo_lite*', 'build/miniblink108/miniblink108.vcxproj') }}
 
       - name: Download all base .lib slices
         uses: actions/download-artifact@v4

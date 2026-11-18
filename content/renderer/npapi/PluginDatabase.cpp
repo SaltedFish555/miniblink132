@@ -23,18 +23,46 @@ mbGetPluginListCallback g_pluginListCallback = nullptr;
 void* g_pluginListCallbackParam = nullptr;
 
 #if defined(_WIN32)
-WTF::String appPluginsDirectory()
+WTF::String moduleBaseDirectory(HMODULE mod)
 {
     WCHAR moduleFileNameStr[MAX_PATH] = { 0 };
-    DWORD len = ::GetModuleFileNameW(nullptr, moduleFileNameStr, MAX_PATH);
+    DWORD len = ::GetModuleFileNameW(mod, moduleFileNameStr, MAX_PATH);
     if (!len || len == MAX_PATH)
         return WTF::String();
     if (!::PathRemoveFileSpecW(moduleFileNameStr))
         return WTF::String();
+    return WTF::String::FromUTF8(base::WideToUTF8(moduleFileNameStr));
+}
 
-    std::wstring dir(moduleFileNameStr);
-    dir += L"\\plugins";
-    return WTF::String::FromUTF8(base::WideToUTF8(dir));
+WTF::String currentDllDirectory()
+{
+    HMODULE selfMod = nullptr;
+    if (!::GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&currentDllDirectory), &selfMod)) {
+        return WTF::String();
+    }
+    return moduleBaseDirectory(selfMod);
+}
+
+WTF::String appPluginsDirectory()
+{
+    WTF::String exeDir = moduleBaseDirectory(nullptr);
+    if (exeDir.empty())
+        return WTF::String();
+    return WTF::String::FromUTF8(exeDir.Utf8() + "\\plugins");
+}
+
+void pushUniqueDirectory(std::vector<WTF::String>& directories, const WTF::String& dir)
+{
+    if (dir.empty())
+        return;
+    std::string dirUtf8 = dir.Utf8();
+    for (const auto& existing : directories) {
+        if (base::EqualsCaseInsensitiveASCII(existing.Utf8(), dirUtf8))
+            return;
+    }
+    directories.push_back(dir);
 }
 
 void addPluginPathsFromRegistry(HKEY rootKey, std::set<std::string>& paths)
@@ -63,18 +91,13 @@ void addPluginPathsFromRegistry(HKEY rootKey, std::set<std::string>& paths)
 
 void addMacromediaPluginDirectories(std::vector<WTF::String>& directories)
 {
+    // Note: On x64 process GetSystemDirectoryW returns System32 (64-bit Flash);
+    // on WOW64 x86 process GetSystemDirectoryW redirects to SysWOW64 (32-bit Flash).
     WCHAR systemDirectoryStr[MAX_PATH] = { 0 };
     if (::GetSystemDirectoryW(systemDirectoryStr, MAX_PATH)) {
         WCHAR macromediaDir[MAX_PATH] = { 0 };
         ::PathCombineW(macromediaDir, systemDirectoryStr, L"Macromed\\Flash");
-        directories.push_back(WTF::String::FromUTF8(base::WideToUTF8(macromediaDir)));
-    }
-
-    WCHAR windowsDir[MAX_PATH] = { 0 };
-    if (::GetWindowsDirectoryW(windowsDir, MAX_PATH)) {
-        WCHAR sysWow64Flash[MAX_PATH] = { 0 };
-        ::PathCombineW(sysWow64Flash, windowsDir, L"SysWOW64\\Macromed\\Flash");
-        directories.push_back(WTF::String::FromUTF8(base::WideToUTF8(sysWow64Flash)));
+        pushUniqueDirectory(directories, WTF::String::FromUTF8(base::WideToUTF8(macromediaDir)));
     }
 }
 #endif
@@ -400,9 +423,15 @@ void PluginDatabase::getPluginPathsInDirectories(std::set<std::string>& paths) c
                 continue;
             std::string fileName = base::WideToUTF8(findData.cFileName);
             std::string lowerName = base::ToLowerASCII(fileName);
-            bool isCandidateDll = base::EndsWith(lowerName, ".dll", base::CompareCase::SENSITIVE)
-                && (base::StartsWith(lowerName, "np", base::CompareCase::SENSITIVE)
-                    || lowerName.find("flash") != std::string::npos);
+            if (!base::EndsWith(lowerName, ".dll", base::CompareCase::SENSITIVE))
+                continue;
+            if (base::StartsWith(lowerName, "pepflash", base::CompareCase::SENSITIVE)
+                || base::StartsWith(lowerName, "mb132", base::CompareCase::SENSITIVE)
+                || base::StartsWith(lowerName, "miniblink", base::CompareCase::SENSITIVE)) {
+                continue;
+            }
+            bool isCandidateDll = base::StartsWith(lowerName, "np", base::CompareCase::SENSITIVE)
+                || lowerName.find("flash") != std::string::npos;
             if (!isCandidateDll)
                 continue;
 
@@ -422,9 +451,16 @@ std::vector<WTF::String> PluginDatabase::defaultPluginDirectories()
 {
     std::vector<WTF::String> directories;
 #if defined(_WIN32)
-    WTF::String ourDir = appPluginsDirectory();
-    if (!ourDir.empty())
-        directories.push_back(ourDir);
+    WTF::String exeDir = moduleBaseDirectory(nullptr);
+    if (!exeDir.empty()) {
+        pushUniqueDirectory(directories, WTF::String::FromUTF8(exeDir.Utf8() + "\\plugins"));
+        pushUniqueDirectory(directories, exeDir);
+    }
+    WTF::String dllDir = currentDllDirectory();
+    if (!dllDir.empty()) {
+        pushUniqueDirectory(directories, WTF::String::FromUTF8(dllDir.Utf8() + "\\plugins"));
+        pushUniqueDirectory(directories, dllDir);
+    }
     addMacromediaPluginDirectories(directories);
 #endif
     return directories;
@@ -433,9 +469,25 @@ std::vector<WTF::String> PluginDatabase::defaultPluginDirectories()
 bool PluginDatabase::isPreferredPluginDirectory(const WTF::String& directory)
 {
 #if defined(_WIN32)
-    WTF::String ourDir = appPluginsDirectory();
-    if (!ourDir.empty() && !directory.empty())
-        return base::EqualsCaseInsensitiveASCII(ourDir.Utf8(), directory.Utf8());
+    if (directory.empty())
+        return false;
+    std::string dirUtf8 = directory.Utf8();
+    WTF::String exeDir = moduleBaseDirectory(nullptr);
+    if (!exeDir.empty()) {
+        std::string exeUtf8 = exeDir.Utf8();
+        if (base::EqualsCaseInsensitiveASCII(dirUtf8, exeUtf8)
+            || base::EqualsCaseInsensitiveASCII(dirUtf8, exeUtf8 + "\\plugins")) {
+            return true;
+        }
+    }
+    WTF::String dllDir = currentDllDirectory();
+    if (!dllDir.empty()) {
+        std::string dllUtf8 = dllDir.Utf8();
+        if (base::EqualsCaseInsensitiveASCII(dirUtf8, dllUtf8)
+            || base::EqualsCaseInsensitiveASCII(dirUtf8, dllUtf8 + "\\plugins")) {
+            return true;
+        }
+    }
 #endif
     return false;
 }
