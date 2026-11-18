@@ -13,6 +13,8 @@
 #include "content/renderer/DevicePostureProviderImpl.h"
 #include "content/renderer/PermissionServiceImpl.h"
 #include "content/renderer/SpeculationHostImpl.h"
+#include "content/renderer/npapi/PluginQuirkSet.h"
+#include "content/renderer/npapi/WebPluginImpl.h"
 #include "content/browser/QuotaManagerHostImpl.h"
 #include "content/browser/FileChooserImpl.h"
 #include "content/browser/RestrictedCookieManagerImpl.h"
@@ -179,7 +181,7 @@ blink::WebLocalFrame* WebLocalFrameClientImpl::CreateChildFrame(
         newClinet->m_blinkPolicyContainerHost.reset(new PolicyContainerHostImpl());
         newClinet->m_blinkPolicyContainerHostReceiver
             = new mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>(newClinet->m_blinkPolicyContainerHost.get());
-        newClinet->m_blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: ÄÚ´æĞ¹Â¶
+        newClinet->m_blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: å†…å­˜æ³„éœ²
     }
 
     //     CreateFrameWidgetParams* createFrameWidgetParams = m_renderWidgetHostImpl->bindAndGenerateCreateFrameWidgetParams();
@@ -565,7 +567,7 @@ void WebLocalFrameClientImpl::updateNavigationHistory(blink::WebHistoryCommitTyp
 
     bool isNewNavigation = commitType == blink::kWebStandardCommit;
 
-    // ¼ûFrameLoader::HandleInitialEmptyDocumentReplacementIfNeeded£¬µÚÒ»´ÎµÄ±ê×¼kWebStandardCommit»á±»Ìæ»»³ÉkReplaceCurrentItem
+    // è§FrameLoader::HandleInitialEmptyDocumentReplacementIfNeededï¼Œç¬¬ä¸€æ¬¡çš„æ ‡å‡†kWebStandardCommitä¼šè¢«æ›¿æ¢æˆkReplaceCurrentItem
     int32_t backListCount = webview->HistoryBackListCount();
     int32_t forwardListCount = webview->HistoryForwardListCount();
     if (0 == backListCount && -1 == forwardListCount)
@@ -788,7 +790,7 @@ void WebLocalFrameClientImpl::loadHistoryItem(blink::WebLocalFrame* frame, const
 
     std::unique_ptr<blink::WebNavigationParams> params = std::make_unique<blink::WebNavigationParams>();
 
-    params->response.SetMimeType("text/html"); // TODO: Õâ¸öÒªÔÚÉÏ´ÎWebHistoryItemÀï¼ÇÂ¼ÏÂÀ´
+    params->response.SetMimeType("text/html"); // TODO: è¿™ä¸ªè¦åœ¨ä¸Šæ¬¡WebHistoryItemé‡Œè®°å½•ä¸‹æ¥
     params->url = historyItem->Url();
 
     mojo::PendingAssociatedRemote<blink::mojom::blink::PolicyContainerHost> policyContainerRemote;
@@ -797,7 +799,7 @@ void WebLocalFrameClientImpl::loadHistoryItem(blink::WebLocalFrame* frame, const
 
     mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>* blinkPolicyContainerHostReceiver
         = new mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>(new PolicyContainerHostImpl());
-    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: ÄÚ´æĞ¹Â¶
+    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: å†…å­˜æ³„éœ²
 
     ::network::mojom::URLResponseHeadPtr urlResponseHead = ::network::mojom::URLResponseHead::New();
 
@@ -817,7 +819,7 @@ void WebLocalFrameClientImpl::loadHistoryItem(blink::WebLocalFrame* frame, const
     urlResponseHead->encoded_data_length = 0; // m_response->ExpectedContentLength();
     urlResponseHead->encoded_body_length = 0; // m_response->ExpectedContentLength();
 
-    mbnet::URLLoaderImpl* urlLoaderImpl = new mbnet::URLLoaderImpl(nullptr); // TODO: ÄÚ´æĞ¹Â¶
+    mbnet::URLLoaderImpl* urlLoaderImpl = new mbnet::URLLoaderImpl(nullptr); // TODO: å†…å­˜æ³„éœ²
 
     ::network::mojom::URLLoaderClientEndpointsPtr urlLoaderClientEndpoints = ::network::mojom::URLLoaderClientEndpoints::New(
         urlLoaderImpl->m_urlLoader.BindNewPipeAndPassRemote(), urlLoaderImpl->m_urlLoaderClient.BindNewPipeAndPassReceiver());
@@ -850,7 +852,7 @@ void WebLocalFrameClientImpl::loadHistoryItem(blink::WebLocalFrame* frame, const
 
     WebLocalFrameClientImpl* client = (WebLocalFrameClientImpl*)impl->Client();
 
-    // ¼ÇµÃÈÃWebURLLoaderManager::handlReceiveData²»Òªµ÷ÓÃBodyLoaderClient::DidStartLoadingResponseBody
+    // è®°å¾—è®©WebURLLoaderManager::handlReceiveDataä¸è¦è°ƒç”¨BodyLoaderClient::DidStartLoadingResponseBody
     std::unique_ptr<blink::WebNavigationInfo> info = std::make_unique<blink::WebNavigationInfo>();
     info->url_request.SetUrl(params->url);
     info->frame_load_type = blink::WebFrameLoadType::kBackForward;
@@ -871,7 +873,7 @@ void WebLocalFrameClientImpl::loadUrl(blink::WebLocalFrame* frame, const blink::
 
     std::unique_ptr<blink::WebNavigationParams> params = std::make_unique<blink::WebNavigationParams>();
 
-    params->response.SetMimeType("text/html"); // TODO: Õâ¸öÒªÔÚÉÏ´ÎWebHistoryItemÀï¼ÇÂ¼ÏÂÀ´
+    params->response.SetMimeType("text/html"); // TODO: è¿™ä¸ªè¦åœ¨ä¸Šæ¬¡WebHistoryItemé‡Œè®°å½•ä¸‹æ¥
     params->url = url;
 #if 1
     mojo::PendingAssociatedRemote<blink::mojom::blink::PolicyContainerHost> policyContainerRemote;
@@ -880,7 +882,7 @@ void WebLocalFrameClientImpl::loadUrl(blink::WebLocalFrame* frame, const blink::
 
     mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>* blinkPolicyContainerHostReceiver
         = new mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>(new PolicyContainerHostImpl());
-    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: ÄÚ´æĞ¹Â¶
+    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: å†…å­˜æ³„éœ²
 
     ::network::mojom::URLResponseHeadPtr urlResponseHead = ::network::mojom::URLResponseHead::New();
 
@@ -900,7 +902,7 @@ void WebLocalFrameClientImpl::loadUrl(blink::WebLocalFrame* frame, const blink::
     urlResponseHead->encoded_data_length = 0; // m_response->ExpectedContentLength();
     urlResponseHead->encoded_body_length = 0; // m_response->ExpectedContentLength();
 
-    mbnet::URLLoaderImpl* urlLoaderImpl = new mbnet::URLLoaderImpl(nullptr); // TODO: ÄÚ´æĞ¹Â¶
+    mbnet::URLLoaderImpl* urlLoaderImpl = new mbnet::URLLoaderImpl(nullptr); // TODO: å†…å­˜æ³„éœ²
 
     ::network::mojom::URLLoaderClientEndpointsPtr urlLoaderClientEndpoints = ::network::mojom::URLLoaderClientEndpoints::New(
         urlLoaderImpl->m_urlLoader.BindNewPipeAndPassRemote(), urlLoaderImpl->m_urlLoaderClient.BindNewPipeAndPassReceiver());
@@ -929,7 +931,7 @@ void WebLocalFrameClientImpl::loadUrl(blink::WebLocalFrame* frame, const blink::
 
     WebLocalFrameClientImpl* client = (WebLocalFrameClientImpl*)impl->Client();
 
-    // ¼ÇµÃÈÃWebURLLoaderManager::handlReceiveData²»Òªµ÷ÓÃBodyLoaderClient::DidStartLoadingResponseBody
+    // è®°å¾—è®©WebURLLoaderManager::handlReceiveDataä¸è¦è°ƒç”¨BodyLoaderClient::DidStartLoadingResponseBody
     std::unique_ptr<blink::WebNavigationInfo> info = std::make_unique<blink::WebNavigationInfo>();
     info->url_request.SetUrl(params->url);
     info->frame_load_type = blink::WebFrameLoadType::kBackForward;
@@ -986,7 +988,7 @@ blink::WebView* WebLocalFrameClientImpl::CreateNewWindow(
 
     blink::WebView* newBlinkWebview = newWebview->createWebWindowOrViewInBlinkThread(self->getWebView(), m_frame, false, newWebview->isTransparent());
 
-    ThreadCall::wake(); // ÈÃuiÏß³Ìµ÷ÓÃµÄapiÍ¬²½Ö´ĞĞÒ»±é£¬·ÀÖ¹ÀıÈçset cookit pathÕâÖÖÒì²½ÉèÖÃ»áµ¼ÖÂÂ©µôÍøÂçÇëÇóÃ»±»ÉèÖÃpathµÄÇé¿ö
+    ThreadCall::wake(); // è®©uiçº¿ç¨‹è°ƒç”¨çš„apiåŒæ­¥æ‰§è¡Œä¸€éï¼Œé˜²æ­¢ä¾‹å¦‚set cookit pathè¿™ç§å¼‚æ­¥è®¾ç½®ä¼šå¯¼è‡´æ¼æ‰ç½‘ç»œè¯·æ±‚æ²¡è¢«è®¾ç½®pathçš„æƒ…å†µ
 
     return newBlinkWebview;
 }
@@ -1052,7 +1054,7 @@ void WebLocalFrameClientImpl::DraggableRegionsChanged()
     webview->draggableRegionsChanged(regions);
 }
 
-// ÓĞ¿ÉÄÜÔÚweb workerÏß³Ì£¬»òÕßnodejs worker
+// æœ‰å¯èƒ½åœ¨web workerçº¿ç¨‹ï¼Œæˆ–è€…nodejs worker
 mbWebFrameHandle v8ContextToMbWebFrameHandle(v8::Local<v8::Context> context)
 {
     v8::Isolate* isolate = context->GetIsolate();
@@ -1243,6 +1245,53 @@ void WebLocalFrameClientImpl::GetInterface(::mojo::GenericPendingReceiver receiv
         createAndBindInterface<::blink::mojom::blink::SharedWorkerConnector, SharedWorkerConnectorImpl>(receiver.PassPipe());
     } else
         DebugBreak();
+}
+
+blink::WebPlugin* WebLocalFrameClientImpl::CreatePlugin(const blink::WebPluginParams& params)
+{
+    if (!isNpapiPluginsEnabled() || !m_frame)
+        return nullptr;
+
+    blink::WebPluginParams newParams = params;
+    std::vector<blink::WebString> attrNames;
+    std::vector<blink::WebString> attrValues;
+    size_t count = std::min(params.attribute_names.size(), params.attribute_values.size());
+    attrNames.reserve(count + 1);
+    attrValues.reserve(count + 1);
+
+    bool hasWmode = false;
+    for (size_t i = 0; i < count; ++i) {
+        attrNames.push_back(params.attribute_names[i]);
+        std::string key = params.attribute_names[i].Utf8();
+        if (base::EqualsCaseInsensitiveASCII(key, "wmode")) {
+            hasWmode = true;
+            std::string val = params.attribute_values[i].Utf8();
+            if (!base::EqualsCaseInsensitiveASCII(val, "opaque") && !base::EqualsCaseInsensitiveASCII(val, "transparent")) {
+                attrValues.push_back(blink::WebString::FromASCII("transparent"));
+            } else {
+                attrValues.push_back(params.attribute_values[i]);
+            }
+        } else {
+            attrValues.push_back(params.attribute_values[i]);
+        }
+    }
+    if (!hasWmode) {
+        attrNames.push_back(blink::WebString::FromASCII("wmode"));
+        attrValues.push_back(blink::WebString::FromASCII("transparent"));
+    }
+    newParams.attribute_names = blink::WebVector<blink::WebString>(attrNames);
+    newParams.attribute_values = blink::WebVector<blink::WebString>(attrValues);
+
+    HWND hostWnd = nullptr;
+    POINT offset { 0, 0 };
+    if (MbWebView* webview = static_cast<MbWebView*>(common::LiveIdDetect::getMbWebviewIds()->getPtr(m_mbwebviewId))) {
+        hostWnd = webview->getHostWnd();
+        offset = webview->getOffset();
+    }
+
+    scoped_refptr<WebPluginImpl> plugin = base::MakeRefCounted<WebPluginImpl>(m_frame, newParams, m_mbwebviewId, hostWnd, offset);
+    plugin->AddRef();
+    return plugin.get();
 }
 
 }

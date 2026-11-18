@@ -1,0 +1,650 @@
+// Copyright (C) 2006-2013 Apple Inc. All rights reserved.
+// Ported and adapted for miniblink132 (Windowless DIB -> cc::PaintCanvas + Windowed fallback).
+
+#include "content/renderer/npapi/WebPluginImpl.h"
+
+#include <cstring>
+
+#include "base/functional/bind.h"
+#include "base/task/single_thread_task_runner.h"
+#include "base/time/time.h"
+#include "cc/paint/paint_canvas.h"
+#include "cc/paint/paint_image.h"
+#include "cc/paint/paint_image_builder.h"
+#include "content/renderer/npapi/PluginMessageThrottlerWin.h"
+#include "third_party/blink/public/web/web_plugin_container.h"
+#include "third_party/skia/include/core/SkImage.h"
+#include "third_party/skia/include/core/SkImageInfo.h"
+#include "third_party/skia/include/core/SkPixmap.h"
+
+#if defined(_WIN32)
+BOOL HookByHotpatch(LPCWSTR szDllName, LPCSTR szFuncName, void* pfnNew, void** pfnOld);
+#endif
+
+namespace content {
+
+namespace {
+
+#if defined(_WIN32)
+const LPCWSTR kWebPluginViewClassName = L"MbWebPluginView";
+const LPCWSTR kWebPluginViewProperty = L"MbWebPluginViewProperty";
+
+using PtrBeginPaint = HDC(WINAPI*)(HWND, PAINTSTRUCT*);
+using PtrEndPaint = BOOL(WINAPI*)(HWND, const PAINTSTRUCT*);
+using PtrIsDebuggerPresent = BOOL(WINAPI*)();
+
+PtrBeginPaint s_origBeginPaint = nullptr;
+PtrEndPaint s_origEndPaint = nullptr;
+PtrIsDebuggerPresent s_origIsDebuggerPresent = nullptr;
+
+BOOL WINAPI hookedIsDebuggerPresent()
+{
+    return FALSE;
+}
+
+void setUpOffscreenPaintingHooks(PtrBeginPaint beginPaintHook, PtrEndPaint endPaintHook)
+{
+    static bool s_haveHooked = false;
+    if (s_haveHooked)
+        return;
+    s_haveHooked = true;
+
+    HookByHotpatch(L"user32.dll", "BeginPaint", reinterpret_cast<void*>(beginPaintHook), reinterpret_cast<void**>(&s_origBeginPaint));
+    HookByHotpatch(L"user32.dll", "EndPaint", reinterpret_cast<void*>(endPaintHook), reinterpret_cast<void**>(&s_origEndPaint));
+    HookByHotpatch(L"kernel32.dll", "IsDebuggerPresent", reinterpret_cast<void*>(&hookedIsDebuggerPresent), reinterpret_cast<void**>(&s_origIsDebuggerPresent));
+}
+
+bool registerPluginViewWindowClass()
+{
+    static bool s_registered = false;
+    if (s_registered)
+        return true;
+    s_registered = true;
+
+    WNDCLASSEXW wcex {};
+    wcex.cbSize = sizeof(WNDCLASSEXW);
+    wcex.style = CS_DBLCLKS;
+    wcex.lpfnWndProc = ::DefWindowProcW;
+    wcex.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+    wcex.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW);
+    wcex.lpszClassName = kWebPluginViewClassName;
+    return !!::RegisterClassExW(&wcex);
+}
+
+LRESULT CALLBACK destroyNullWndProc(HWND, UINT, WPARAM, LPARAM)
+{
+    return 0;
+}
+
+void destroyPluginWindowAsync(intptr_t widgetAddr)
+{
+    HWND widget = reinterpret_cast<HWND>(widgetAddr);
+    if (!widget)
+        return;
+    if (::IsWindowUnicode(widget))
+        ::SetWindowLongPtrW(widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&destroyNullWndProc));
+    else
+        ::SetWindowLongPtrA(widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&destroyNullWndProc));
+    ::DestroyWindow(widget);
+}
+#endif // defined(_WIN32)
+
+bool isWindowsMessageUserGesture(UINT message)
+{
+#if defined(_WIN32)
+    return message == WM_LBUTTONUP || message == WM_MBUTTONUP || message == WM_RBUTTONUP || message == WM_KEYUP;
+#else
+    return false;
+#endif
+}
+
+void forceOpaqueAlphaChannel(void* pixels, size_t byteLength)
+{
+    if (!pixels || (byteLength % 4) != 0)
+        return;
+    auto* ptr = static_cast<uint32_t*>(pixels);
+    size_t count = byteLength / 4;
+    for (size_t i = 0; i < count; ++i)
+        ptr[i] |= 0xFF000000u;
+}
+
+} // namespace
+
+HDC WINAPI WebPluginImpl::hookedBeginPaint(HWND hWnd, PAINTSTRUCT* lpPaint)
+{
+#if defined(_WIN32)
+    auto* view = reinterpret_cast<WebPluginImpl*>(::GetPropW(hWnd, kWebPluginViewProperty));
+    if (view && view->m_wmPrintHDC) {
+        memset(lpPaint, 0, sizeof(PAINTSTRUCT));
+        lpPaint->hdc = view->m_wmPrintHDC;
+        ::GetClientRect(hWnd, &lpPaint->rcPaint);
+        return view->m_wmPrintHDC;
+    }
+    if (s_origBeginPaint)
+        return s_origBeginPaint(hWnd, lpPaint);
+#endif
+    return nullptr;
+}
+
+BOOL WINAPI WebPluginImpl::hookedEndPaint(HWND hWnd, const PAINTSTRUCT* lpPaint)
+{
+#if defined(_WIN32)
+    auto* view = reinterpret_cast<WebPluginImpl*>(::GetPropW(hWnd, kWebPluginViewProperty));
+    if (view && view->m_wmPrintHDC)
+        return TRUE;
+    if (s_origEndPaint)
+        return s_origEndPaint(hWnd, lpPaint);
+#endif
+    return TRUE;
+}
+
+LRESULT CALLBACK WebPluginImpl::PluginViewWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+#if defined(_WIN32)
+    auto* view = reinterpret_cast<WebPluginImpl*>(::GetPropW(hWnd, kWebPluginViewProperty));
+    if (!view)
+        return ::DefWindowProcW(hWnd, message, wParam, lParam);
+    ++view->m_pluginViewWndProcReentryCount;
+    if (view->m_pluginViewWndProcReentryCount > 10) {
+        --view->m_pluginViewWndProcReentryCount;
+        return 0;
+    }
+    LRESULT ret = view->wndProc(hWnd, message, wParam, lParam);
+    --view->m_pluginViewWndProcReentryCount;
+    return ret;
+#else
+    return 0;
+#endif
+}
+
+LRESULT WebPluginImpl::wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+#if defined(_WIN32)
+    switch (message) {
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        ::SetCapture(hWnd);
+        break;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+        ::ReleaseCapture();
+        break;
+    }
+
+    if (message == m_lastMessage
+        && m_plugin && m_plugin->quirks().contains(PluginQuirkDontCallWndProcForSameMessageRecursively)
+        && m_isCallingPluginWndProc) {
+        return 1;
+    }
+
+    if (message == WM_USER + 1 && m_plugin && m_plugin->quirks().contains(PluginQuirkThrottleWMUserPlusOneMessages)) {
+        if (!m_messageThrottler)
+            m_messageThrottler = std::make_unique<PluginMessageThrottlerWin>(this);
+        m_messageThrottler->appendMessage(hWnd, message, wParam, lParam);
+        return 0;
+    }
+
+    m_lastMessage = message;
+    m_isCallingPluginWndProc = true;
+
+    if (m_plugin && m_plugin->pluginFuncs()->version < NPVERS_HAS_POPUPS_ENABLED_STATE
+        && isWindowsMessageUserGesture(message) && !m_popPopupsStateTimer.IsRunning()) {
+        pushPopupsEnabledState(true);
+        m_popPopupsStateTimer.Start(FROM_HERE, base::TimeDelta(),
+            base::BindOnce(&WebPluginImpl::popPopupsStateTimerFired, base::Unretained(this)));
+    }
+
+    if (message == WM_PRINTCLIENT) {
+        message = WM_PAINT;
+        m_wmPrintHDC = reinterpret_cast<HDC>(wParam);
+    }
+
+    LRESULT result = m_pluginWndProc ? ::CallWindowProcW(m_pluginWndProc, hWnd, message, wParam, lParam) : 0;
+    m_wmPrintHDC = nullptr;
+    m_isCallingPluginWndProc = false;
+    return result;
+#else
+    return 0;
+#endif
+}
+
+void WebPluginImpl::ensureBackingDib(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return;
+    if (m_memoryBitmap && m_memoryCanvasSize.cx == width && m_memoryCanvasSize.cy == height)
+        return;
+
+    releaseBackingDib();
+
+#if defined(_WIN32)
+    m_memoryDC = ::CreateCompatibleDC(nullptr);
+    if (!m_memoryDC)
+        return;
+
+    ::SetGraphicsMode(m_memoryDC, GM_ADVANCED);
+
+    BITMAPINFO bmi {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height; // Top-down BGRA DIB matching Skia N32 layout
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    m_memoryBitmap = ::CreateDIBSection(m_memoryDC, &bmi, DIB_RGB_COLORS, &m_memoryPixels, nullptr, 0);
+    if (!m_memoryBitmap || !m_memoryPixels) {
+        releaseBackingDib();
+        return;
+    }
+
+    m_oldBitmap = ::SelectObject(m_memoryDC, m_memoryBitmap);
+    m_memoryCanvasSize.cx = width;
+    m_memoryCanvasSize.cy = height;
+#endif
+}
+
+void WebPluginImpl::releaseBackingDib()
+{
+#if defined(_WIN32)
+    if (m_memoryDC && m_oldBitmap) {
+        ::SelectObject(m_memoryDC, m_oldBitmap);
+        m_oldBitmap = nullptr;
+    }
+    if (m_memoryBitmap) {
+        ::DeleteObject(m_memoryBitmap);
+        m_memoryBitmap = nullptr;
+    }
+    if (m_memoryDC) {
+        ::DeleteDC(m_memoryDC);
+        m_memoryDC = nullptr;
+    }
+#endif
+    m_memoryPixels = nullptr;
+    m_memoryCanvasSize = { 0, 0 };
+}
+
+void WebPluginImpl::setRgnIfNeeded(const gfx::Rect& windowRect, const gfx::Rect& oldWindowRect, const gfx::Rect& oldClipRect)
+{
+    if (!m_plugin)
+        return;
+    if (m_haveUpdatedPluginWidget && m_windowRect == oldWindowRect && m_clipRect == oldClipRect)
+        return;
+
+    setCallingPlugin(true);
+#if defined(_WIN32)
+    if (m_widget) {
+        bool clipToZeroRect = !m_plugin->quirks().contains(PluginQuirkDontClipToZeroRectWhenScrolling);
+        if (clipToZeroRect) {
+            HRGN zeroRgn = ::CreateRectRgn(0, 0, 0, 0);
+            ::SetWindowRgn(m_widget, zeroRgn, FALSE);
+        } else {
+            HRGN clipRgn = ::CreateRectRgn(m_clipRect.x(), m_clipRect.y(), m_clipRect.right(), m_clipRect.bottom());
+            ::SetWindowRgn(m_widget, clipRgn, TRUE);
+        }
+
+        if (!m_haveUpdatedPluginWidget || m_windowRect != oldWindowRect) {
+            ::MoveWindow(m_widget, m_windowRect.x() + m_widgetOffset.x(), m_windowRect.y() + m_widgetOffset.y(),
+                m_windowRect.width(), m_windowRect.height(), TRUE);
+        }
+
+        if (clipToZeroRect) {
+            HRGN clipRgn = ::CreateRectRgn(m_clipRect.x(), m_clipRect.y(), m_clipRect.right(), m_clipRect.bottom());
+            ::SetWindowRgn(m_widget, clipRgn, TRUE);
+        }
+    }
+#endif
+    setNPWindowRect(windowRect);
+    setCallingPlugin(false);
+    m_haveUpdatedPluginWidget = true;
+}
+
+void WebPluginImpl::updatePluginWidget(const gfx::Rect& windowRect, const gfx::Rect& clipRect, bool isVisible)
+{
+    gfx::Rect oldWindowRect = m_windowRect;
+    gfx::Rect oldClipRect = m_clipRect;
+    m_windowRect = windowRect;
+    m_clipRect = clipRect;
+    m_isVisible = isVisible;
+
+    setRgnIfNeeded(windowRect, oldWindowRect, oldClipRect);
+
+#if defined(_WIN32)
+    if (m_widget)
+        ::ShowWindow(m_widget, isVisible ? SW_SHOWNA : SW_HIDE);
+#endif
+
+    if (!m_isWindowed && m_windowRect.width() > 0 && m_windowRect.height() > 0)
+        ensureBackingDib(m_windowRect.width(), m_windowRect.height());
+}
+
+void WebPluginImpl::UpdateGeometry(
+    const gfx::Rect& windowRect, const gfx::Rect& clipRect, const gfx::Rect& /*unobscuredRect*/, bool isVisible)
+{
+    updatePluginWidget(windowRect, clipRect, isVisible);
+}
+
+void WebPluginImpl::visibilityTimerFired()
+{
+#if defined(_WIN32)
+    if (m_widget)
+        ::ShowWindow(m_widget, m_isVisible ? SW_SHOWNA : SW_HIDE);
+#endif
+}
+
+void WebPluginImpl::UpdateVisibility(bool isVisible)
+{
+    m_isVisible = isVisible;
+    if (!m_visibilityTimer.IsRunning()) {
+        m_visibilityTimer.Start(FROM_HERE, base::TimeDelta(),
+            base::BindOnce(&WebPluginImpl::visibilityTimerFired, base::Unretained(this)));
+    }
+}
+
+bool WebPluginImpl::dispatchNPEvent(NPEvent& npEvent)
+{
+#if defined(_WIN32)
+    if (!m_plugin || !m_plugin->pluginFuncs()->event || !m_instance)
+        return true;
+
+    bool shouldPop = false;
+    if (m_plugin->pluginFuncs()->version < NPVERS_HAS_POPUPS_ENABLED_STATE && isWindowsMessageUserGesture(npEvent.event)) {
+        pushPopupsEnabledState(true);
+        shouldPop = true;
+    }
+
+    setCallingPlugin(true);
+    bool accepted = (m_plugin->pluginFuncs()->event(m_instance, &npEvent) != 0);
+    setCallingPlugin(false);
+
+    if (shouldPop)
+        popPopupsEnabledState();
+
+    return accepted;
+#else
+    return false;
+#endif
+}
+
+void WebPluginImpl::setNPWindowRect(const gfx::Rect& rect)
+{
+    if (!m_isStarted || !m_plugin || !m_instance)
+        return;
+
+    m_npWindow.x = rect.x();
+    m_npWindow.y = rect.y();
+    m_npWindow.width = rect.width();
+    m_npWindow.height = rect.height();
+    m_npWindow.clipRect.left = 0;
+    m_npWindow.clipRect.top = 0;
+    m_npWindow.clipRect.right = static_cast<uint16_t>(rect.width());
+    m_npWindow.clipRect.bottom = static_cast<uint16_t>(rect.height());
+
+    if (m_plugin->pluginFuncs()->setwindow) {
+        setCallingPlugin(true);
+        bool needSetWindow = (m_npWindow.width != 1 || m_npWindow.height != 1)
+            || (m_plugin->name().Utf8().find("GZBank") == std::string::npos);
+        if (needSetWindow)
+            m_plugin->pluginFuncs()->setwindow(m_instance, &m_npWindow);
+        setCallingPlugin(false);
+        m_haveCalledSetWindow = true;
+
+#if defined(_WIN32)
+        if (m_isWindowed && m_widget) {
+            WNDPROC currentWndProc = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(m_widget, GWLP_WNDPROC));
+            if (needSetWindow && currentWndProc != PluginViewWndProc) {
+                m_pluginWndProc = reinterpret_cast<WNDPROC>(
+                    ::SetWindowLongPtrW(m_widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(PluginViewWndProc)));
+            }
+        }
+#endif
+    }
+}
+
+void WebPluginImpl::paintIntoTransformedContext(HDC hdc)
+{
+#if defined(_WIN32)
+    if (m_isWindowed || !hdc)
+        return;
+
+    m_npWindow.type = NPWindowTypeDrawable;
+    m_npWindow.window = hdc;
+
+    gfx::Rect r = m_windowRect;
+    if (r.IsEmpty())
+        r = gfx::Rect(0, 0, 1, 1);
+
+    WINDOWPOS windowpos {};
+    windowpos.x = r.x();
+    windowpos.y = r.y();
+    windowpos.cx = r.width();
+    windowpos.cy = r.height();
+
+    NPEvent npEvent {};
+    npEvent.event = WM_WINDOWPOSCHANGED;
+    npEvent.lParam = reinterpret_cast<uintptr_t>(&windowpos);
+    npEvent.wParam = 0;
+    dispatchNPEvent(npEvent);
+
+    setNPWindowRect(r);
+
+    npEvent.event = WM_PAINT;
+    npEvent.wParam = reinterpret_cast<uintptr_t>(hdc);
+    npEvent.lParam = 0;
+    dispatchNPEvent(npEvent);
+#endif
+}
+
+void WebPluginImpl::Paint(cc::PaintCanvas* canvas, const gfx::Rect& rect)
+{
+    if (!m_isStarted || !canvas || !m_pluginContainer)
+        return;
+
+    if (!m_haveCalledSetWindow) {
+        gfx::Rect initRect = m_windowRect.IsEmpty() ? rect : m_windowRect;
+        setNPWindowRect(initRect);
+    }
+
+    if (m_isWindowed)
+        return;
+
+    int width = m_windowRect.width();
+    int height = m_windowRect.height();
+    if (width <= 0 || height <= 0)
+        return;
+
+    ensureBackingDib(width, height);
+    if (!m_memoryDC || !m_memoryPixels)
+        return;
+
+    size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    if (m_isTransparent) {
+        memset(m_memoryPixels, 0, byteSize);
+    } else {
+        memset(m_memoryPixels, 0xFF, byteSize);
+    }
+
+#if defined(_WIN32)
+    XFORM originalTransform {};
+    ::GetWorldTransform(m_memoryDC, &originalTransform);
+    XFORM transform = originalTransform;
+    transform.eDx = static_cast<FLOAT>(-m_windowRect.x());
+    transform.eDy = static_cast<FLOAT>(-m_windowRect.y());
+    ::SetWorldTransform(m_memoryDC, &transform);
+
+    paintIntoTransformedContext(m_memoryDC);
+
+    ::SetWorldTransform(m_memoryDC, &originalTransform);
+#endif
+
+    if (!m_isTransparent)
+        forceOpaqueAlphaChannel(m_memoryPixels, byteSize);
+
+    SkImageInfo imgInfo = SkImageInfo::MakeN32Premul(width, height);
+    SkPixmap pixmap(imgInfo, m_memoryPixels, static_cast<size_t>(width) * 4);
+    sk_sp<SkImage> skImage = SkImages::RasterFromPixmapCopy(pixmap);
+    if (!skImage)
+        return;
+
+    cc::PaintImage paintImage = cc::PaintImageBuilder::WithDefault()
+        .set_id(cc::PaintImage::GetNextId())
+        .set_image(std::move(skImage), cc::PaintImage::GetNextContentId())
+        .TakePaintImage();
+
+    canvas->drawImage(paintImage, static_cast<SkScalar>(m_windowRect.x()), static_cast<SkScalar>(m_windowRect.y()));
+}
+
+bool WebPluginImpl::platformGetValueStatic(NPNVariable, void*, NPError*)
+{
+    return false;
+}
+
+bool WebPluginImpl::platformGetValue(NPNVariable variable, void* value, NPError* result)
+{
+    switch (variable) {
+    case NPNVnetscapeWindow:
+        *reinterpret_cast<HWND*>(value) = m_widget ? m_widget : m_parentWidget;
+        *result = NPERR_NO_ERROR;
+        return true;
+    case NPNVSupportsWindowless:
+        *reinterpret_cast<NPBool*>(value) = TRUE;
+        *result = NPERR_NO_ERROR;
+        return true;
+    default:
+        return false;
+    }
+}
+
+void WebPluginImpl::invalidateRect(const gfx::Rect& rect)
+{
+#if defined(_WIN32)
+    if (m_isWindowed) {
+        if (m_widget) {
+            RECT invalidRect { rect.x(), rect.y(), rect.right(), rect.bottom() };
+            ::InvalidateRect(m_widget, &invalidRect, FALSE);
+        }
+        return;
+    }
+#endif
+    if (m_pluginContainer) {
+        m_pluginContainer->Invalidate();
+        m_pluginContainer->ScheduleAnimation();
+    }
+}
+
+void WebPluginImpl::invalidateTimerFired()
+{
+    if (!m_invalidRects.empty()) {
+        m_invalidRects.clear();
+        if (m_pluginContainer) {
+            m_pluginContainer->Invalidate();
+            m_pluginContainer->ScheduleAnimation();
+        }
+    }
+}
+
+void WebPluginImpl::invalidateRect(NPRect* rect)
+{
+    if (!m_pluginContainer)
+        return;
+
+    if (!rect) {
+        invalidateRect(gfx::Rect(0, 0, m_windowRect.width(), m_windowRect.height()));
+        return;
+    }
+
+    gfx::Rect r(rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top);
+    if (m_isWindowed) {
+        invalidateRect(r);
+    } else if (m_plugin && m_plugin->quirks().contains(PluginQuirkThrottleInvalidate)) {
+        m_invalidRects.push_back(r);
+        if (!m_invalidateTimer.IsRunning()) {
+            m_invalidateTimer.Start(FROM_HERE, base::Milliseconds(1),
+                base::BindOnce(&WebPluginImpl::invalidateTimerFired, base::Unretained(this)));
+        }
+    } else {
+        invalidateRect(r);
+    }
+}
+
+void WebPluginImpl::invalidateRegion(NPRegion region)
+{
+    if (m_isWindowed || !m_pluginContainer)
+        return;
+#if defined(_WIN32)
+    RECT r {};
+    if (region && ::GetRgnBox(static_cast<HRGN>(region), &r) != 0) {
+        invalidateRect(gfx::Rect(r.left, r.top, r.right - r.left, r.bottom - r.top));
+        return;
+    }
+#endif
+    invalidateRect(gfx::Rect(0, 0, m_windowRect.width(), m_windowRect.height()));
+}
+
+void WebPluginImpl::forceRedraw()
+{
+#if defined(_WIN32)
+    if (m_isWindowed && m_widget) {
+        ::UpdateWindow(m_widget);
+        return;
+    }
+#endif
+    if (m_pluginContainer) {
+        m_pluginContainer->Invalidate();
+        m_pluginContainer->ScheduleAnimation();
+    }
+}
+
+bool WebPluginImpl::platformStart()
+{
+    if (!m_pluginContainer)
+        return false;
+
+#if defined(_WIN32)
+    if (m_isWindowed) {
+        registerPluginViewWindowClass();
+        setUpOffscreenPaintingHooks(&WebPluginImpl::hookedBeginPaint, &WebPluginImpl::hookedEndPaint);
+
+        DWORD flags = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+        if (m_isVisible)
+            flags |= WS_VISIBLE;
+
+        m_widget = ::CreateWindowExW(0, kWebPluginViewClassName, nullptr, flags, 0, 0, 0, 0, m_parentWidget, nullptr, nullptr, nullptr);
+        if (m_widget) {
+            ::EnableWindow(m_widget, TRUE);
+            ::SetWindowLongPtrW(m_widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(::DefWindowProcW));
+            ::SetPropW(m_widget, kWebPluginViewProperty, this);
+        }
+        m_npWindow.type = NPWindowTypeWindow;
+        m_npWindow.window = m_widget;
+    } else
+#endif
+    {
+        m_npWindow.type = NPWindowTypeDrawable;
+        m_npWindow.window = nullptr;
+    }
+
+    gfx::Rect initialRect = m_windowRect.IsEmpty() ? gfx::Rect(0, 0, 1, 1) : m_windowRect;
+    gfx::Rect initialClip = m_clipRect.IsEmpty() ? initialRect : m_clipRect;
+    updatePluginWidget(initialRect, initialClip, true);
+    return true;
+}
+
+void WebPluginImpl::platformDestroy()
+{
+    releaseBackingDib();
+
+#if defined(_WIN32)
+    if (m_widget) {
+        HWND widget = m_widget;
+        m_widget = nullptr;
+        ::ShowWindow(widget, SW_HIDE);
+        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+            FROM_HERE, base::BindOnce(&destroyPluginWindowAsync, reinterpret_cast<intptr_t>(widget)));
+    }
+#endif
+}
+
+} // namespace content

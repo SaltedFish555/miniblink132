@@ -1,5 +1,5 @@
 <Project>
-  <PropertyGroup>
+  <PropertyGroup Condition="Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\clang+llvm-18.1.8-x86_64')">
     <LLVMInstallDir>C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\clang+llvm-18.1.8-x86_64</LLVMInstallDir>
     <!--<LLVMToolsVersion>18.1.8</LLVMToolsVersion>-->
     <LLVMToolsVersion>18</LLVMToolsVersion>

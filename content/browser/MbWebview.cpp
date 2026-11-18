@@ -5,6 +5,7 @@
 #include "content/renderer/RenderThreadImpl.h"
 #include "content/renderer/PolicyContainerHostImpl.h"
 #include "content/renderer/WebLocalFrameClientImpl.h"
+#include "content/renderer/npapi/PluginQuirkSet.h"
 #include "content/renderer/BlinkInterfaceRegistryImpl.h"
 #include "content/renderer/PlatformEventHandler.h"
 #include "content/browser/RenderWidgetHostImpl.h"
@@ -104,7 +105,7 @@ MbWebView::MbWebView(bool isPopup)
     OutputDebugStringA(output);
 }
 
-// ±¾º¯ÊıÔÚblinkÏß³Ì
+// æœ¬å‡½æ•°åœ¨blinkçº¿ç¨‹
 MbWebView::~MbWebView()
 {
     char output[100] = { 0 };
@@ -120,7 +121,7 @@ MbWebView::~MbWebView()
 //     ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [](MbWebView* self) { delete self; });
 // }
 
-// ´Ëº¯Êı¿ÉÔËĞĞÔÚuiºÍblinkÏß³Ì
+// æ­¤å‡½æ•°å¯è¿è¡Œåœ¨uiå’Œblinkçº¿ç¨‹
 static void clearUiHwnd(HWND hWnd, UINT_PTR self)
 {
     ::KillTimer(hWnd, self);
@@ -138,8 +139,8 @@ void MbWebView::preDestroyOnBlinkThread()
     m_state = kPageDestroyed;
 
     if (m_renderWidgetHostImpl)
-        m_renderWidgetHostImpl->destroy(); // ÕâÀïÃæAsyncLayerTreeFrameSinkÍ¬²½Ïú»Ù
-    //m_renderWidgetHostImpl.release(); // TODO:ÔİÊ±²»Îö¹¹
+        m_renderWidgetHostImpl->destroy(); // è¿™é‡Œé¢AsyncLayerTreeFrameSinkåŒæ­¥é”€æ¯
+    //m_renderWidgetHostImpl.release(); // TODO:æš‚æ—¶ä¸ææ„
 
     MbWebView* self = this;
     int* aysnCount = (int*)malloc(sizeof(int));
@@ -194,7 +195,7 @@ void MbWebView::preDestroyOnBlinkThread()
     if (m_memoryCanvas)
         delete m_memoryCanvas;
         //if (m_surface)
-        //   cairo_surface_destroy((cairo_surface_t*)m_surface); // ~OffscreenWindowUpdaterÀï»áÊÍ·ÅÕâ¸öm_surface
+        //   cairo_surface_destroy((cairo_surface_t*)m_surface); // ~OffscreenWindowUpdateré‡Œä¼šé‡Šæ”¾è¿™ä¸ªm_surface
 #endif
     //::DeleteCriticalSection(&m_memoryCanvasLock);
     ::DeleteCriticalSection(&m_mouseMsgQueueLock);
@@ -225,13 +226,13 @@ bool MbWebView::preDestroyOnUiThread()
     //::SetWindowLongPtrW(m_hWnd, GWLP_USERDATA, 0);
 
 #ifdef OS_LINUX
-    // ÔÚlinuxÏÂ£¬´°¿Ú¾ä±úÓĞ¿ÉÄÜÊÇLinuxGdiBindWindowByGtk´´½¨µÄ£¬´ËÊ±ÊÇÊÕ²»µ½´°¿Ú¹Ø±ÕµÄÏûÏ¢£¨ÒòÎªÍâ²¿ÊÖ¶¯¹Ø±ÕÁË£©£¬ËùÒÔÒªÊÖ¶¯À´Ò»´Î
+    // åœ¨linuxä¸‹ï¼Œçª—å£å¥æŸ„æœ‰å¯èƒ½æ˜¯LinuxGdiBindWindowByGtkåˆ›å»ºçš„ï¼Œæ­¤æ—¶æ˜¯æ”¶ä¸åˆ°çª—å£å…³é—­çš„æ¶ˆæ¯ï¼ˆå› ä¸ºå¤–éƒ¨æ‰‹åŠ¨å…³é—­äº†ï¼‰ï¼Œæ‰€ä»¥è¦æ‰‹åŠ¨æ¥ä¸€æ¬¡
     ::DestroyWindow(m_hWnd);
 #endif
     return true;
 }
 
-// ±¾º¯ÊıÔÚwebkitÏß³Ì
+// æœ¬å‡½æ•°åœ¨webkitçº¿ç¨‹
 void MbWebView::initializeCompositorInBlinkThread(/*gfx::AcceleratedWidget hwnd*/ bool isTransparent)
 {
     //m_hWnd = hwnd;
@@ -253,7 +254,7 @@ void MbWebView::initializeCompositorInBlinkThread(/*gfx::AcceleratedWidget hwnd*
 
     m_host = std::make_unique<content::VizHost>(this,
         //m_hWnd,
-        isTransparent, gfx::Size(1, 1), // ÏÈËæ±ãĞ´Ò»¸ö¼ÙµÄ´óĞ¡£¬Õâ»á²úÉúÒ»¸öĞ¡ºÚÉ«³¤·½ĞÎ
+        isTransparent, gfx::Size(1, 1), // å…ˆéšä¾¿å†™ä¸€ä¸ªå‡çš„å¤§å°ï¼Œè¿™ä¼šäº§ç”Ÿä¸€ä¸ªå°é»‘è‰²é•¿æ–¹å½¢
         std::move(frameSinkManagerClientReceiver), std::move(frameSinkManager), content::RenderThreadImpl::get()->m_hostThread.task_runner(),
         m_service->GetCompositorThreadRunner());
 
@@ -364,7 +365,7 @@ blink::WebView* MbWebView::createWebWindowOrViewInBlinkThread(blink::WebView* op
     return initializeViewInBlinkThread(opener, openerWebFrame);
 }
 
-// µ±±¾MbWebView×÷ÎªÏÂÀ­¿òµÄÍâ²¿ÈİÆ÷Ê±×ßµ½ÕâÀï
+// å½“æœ¬MbWebViewä½œä¸ºä¸‹æ‹‰æ¡†çš„å¤–éƒ¨å®¹å™¨æ—¶èµ°åˆ°è¿™é‡Œ
 void MbWebView::initPopupWidgetModeInBlinkThread(mbWebView parentWebviewId, ::mojo::PendingAssociatedReceiver<::blink::mojom::blink::PopupWidgetHost> popupHost,
     ::mojo::PendingAssociatedReceiver<::blink::mojom::blink::WidgetHost> blinkWidgetHost,
     ::mojo::PendingAssociatedRemote<::blink::mojom::blink::Widget> blinkWidget)
@@ -420,7 +421,7 @@ blink::WebView* MbWebView::initializeViewInBlinkThread(blink::WebView* opener, b
 
     mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>* blinkPolicyContainerHostReceiver
         = new mojo::AssociatedReceiver<blink::mojom::blink::PolicyContainerHost>(new content::PolicyContainerHostImpl());
-    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: ÄÚ´æĞ¹Â¶
+    blinkPolicyContainerHostReceiver->Bind(std::move(policyContainerReceiver)); // TODO: å†…å­˜æ³„éœ²
 
     std::unique_ptr<blink::WebPolicyContainer> policyContainer = std::make_unique<blink::WebPolicyContainer>(
         blink::WebPolicyContainerPolicies(), blink::ToCrossVariantAssociatedMojoType(std::move(policyContainerRemote)));
@@ -562,9 +563,12 @@ void MbWebView::setDefaultPreferences(blink::WebViewImpl* webWiew)
     }
 
     blink::web_pref::WebPreferences webPreferences = webWiew->GetWebPreferences();
-    webPreferences.touch_event_feature_detection_enabled = false; // ×ÀÃæ°æ²»Ìá¹©ontouchstartµÈdocument
+    webPreferences.touch_event_feature_detection_enabled = false; // æ¡Œé¢ç‰ˆä¸æä¾›ontouchstartç­‰document
     webPreferences.allow_universal_access_from_file_urls = true;
     webPreferences.allow_file_access_from_file_urls = true;
+    bool npapiEnabled = content::isNpapiPluginsEnabled();
+    webPreferences.plugins_enabled = npapiEnabled;
+    webPreferences.allow_non_empty_navigator_plugins = npapiEnabled;
     webWiew->SetWebPreferences(webPreferences);
 
     webWiew->SetPageAttributionSupport(network::mojom::AttributionSupport::kWeb);
@@ -591,7 +595,7 @@ void MbWebView::setDefaultPreferences(blink::WebViewImpl* webWiew)
     //preferences.system_font_family_name;
 #endif
 #if BUILDFLAG(IS_WIN)
-    //const char16_t* fontStr = u"ËÎÌå";
+    //const char16_t* fontStr = u"å®‹ä½“";
     const char16_t* fontStr = u"Microsoft YaHei";
 
     preferences.caption_font_family_name = fontStr;
@@ -695,7 +699,7 @@ LRESULT MbWebView::windowProcImpl(HWND hWnd, UINT message, WPARAM wParam, LPARAM
 
     case WM_ERASEBKGND:
         break;
-    case WM_GETDLGCODE: // Ê¹µÃMB¿Ø¼ş×÷Îª¶Ô»°¿ò×Ó´°¿ÚÊ±¿É½ÓÊÕµ½¼üÅÌÏûÏ¢
+    case WM_GETDLGCODE: // ä½¿å¾—MBæ§ä»¶ä½œä¸ºå¯¹è¯æ¡†å­çª—å£æ—¶å¯æ¥æ”¶åˆ°é”®ç›˜æ¶ˆæ¯
         return DLGC_WANTARROWS | DLGC_WANTALLKEYS | DLGC_WANTCHARS;
 
     case WM_CREATE:
@@ -891,7 +895,7 @@ LRESULT MbWebView::windowProcImpl(HWND hWnd, UINT message, WPARAM wParam, LPARAM
 
     case WM_NCHITTEST:
 #ifndef _WIN32
-        return onNcHittest(lParam); // Ö»ÔÚlinux°æ±¾ÏÂ´¦Àí
+        return onNcHittest(lParam); // åªåœ¨linuxç‰ˆæœ¬ä¸‹å¤„ç†
 #endif // _WIN32
         break;
     case WM_CHAR:
@@ -913,13 +917,13 @@ LRESULT MbWebView::windowProcImpl(HWND hWnd, UINT message, WPARAM wParam, LPARAM
     }
     case WM_IME_CHAR: {
         mbFireWindowsMessageImpl(getWebviewHandle(), hWnd, WM_IME_CHAR, wParam, lParam, nullptr);
-        return 0; // ÕâÀï±ØĞë·µ»Ø0£¬·ñÔò»áÔÚWM_IME_STARTCOMPOSITIONµÈÏûÏ¢ÆÚ¼äÊÕµ½WM_CHAR£¬µ¼ÖÂÖØ¸´ÏÔÊ¾ºº×Ö
+        return 0; // è¿™é‡Œå¿…é¡»è¿”å›0ï¼Œå¦åˆ™ä¼šåœ¨WM_IME_STARTCOMPOSITIONç­‰æ¶ˆæ¯æœŸé—´æ”¶åˆ°WM_CHARï¼Œå¯¼è‡´é‡å¤æ˜¾ç¤ºæ±‰å­—
     }
     case WM_IME_STARTCOMPOSITION:
         if (mbFireWindowsMessageImpl(getWebviewHandle(), hWnd, WM_IME_STARTCOMPOSITION, wParam, lParam, nullptr))
             return 0;
         break;
-    case WM_IME_COMPOSITION: // Õâ¸öÊÇÊäÈë·¨ÓĞ×Ö·ûÊ±µÄÏûÏ¢¡£Èç¹ûÊäÈë·¨°´ÁË¿Õ¸ñ£¬¾Í»áÓĞWM_IME_CHAR±íÊ¾È·¶¨ÓĞ×Ö·ûĞ´ÈëÁË
+    case WM_IME_COMPOSITION: // è¿™ä¸ªæ˜¯è¾“å…¥æ³•æœ‰å­—ç¬¦æ—¶çš„æ¶ˆæ¯ã€‚å¦‚æœè¾“å…¥æ³•æŒ‰äº†ç©ºæ ¼ï¼Œå°±ä¼šæœ‰WM_IME_CHARè¡¨ç¤ºç¡®å®šæœ‰å­—ç¬¦å†™å…¥äº†
         if (mbFireWindowsMessageImpl(getWebviewHandle(), hWnd, WM_IME_COMPOSITION, wParam, lParam, nullptr))
             return 0;
         break;
@@ -1065,7 +1069,7 @@ void MbWebView::onPaintUpdatedInUiThread(const HDC hdc, int x, int y, int cx, in
     bool sizeChange = !(m_clientSizeCache.cx == m_clientSize.cx && m_clientSizeCache.cy == m_clientSize.cy);
     ::LeaveCriticalSection(&m_clientSizeLock);
 
-    if (sizeChange) // Èç¹ûÉÏ´ÎresizeµÄÊ±ºò»¹Ã»PaintÏûÏ¢£¬¾Í»áÈ±Ò»´Îresize
+    if (sizeChange) // å¦‚æœä¸Šæ¬¡resizeçš„æ—¶å€™è¿˜æ²¡Paintæ¶ˆæ¯ï¼Œå°±ä¼šç¼ºä¸€æ¬¡resize
         updataBlinkSize();
 }
 
@@ -1081,11 +1085,11 @@ void MbWebView::updataBlinkSize()
         self->m_updataBlinkSizeAsyn = false;
 
         if (self->m_host && self->m_renderWidgetHostImpl && self->m_renderWidgetHostImpl->isSinkReady()) {
-            //RenderFrameMetadataObserverClientImpl::OnRenderFrameMetadataChangedÃ»×ßµÄÊ±ºòisAllowResizeÎªfalse
+            //RenderFrameMetadataObserverClientImpl::OnRenderFrameMetadataChangedæ²¡èµ°çš„æ—¶å€™isAllowResizeä¸ºfalse
             if (self->m_renderWidgetHostImpl->isAllowResize()) {
                 ::EnterCriticalSection(&self->m_clientSizeLock);
                 self->m_clientSizeCache = clientSize;
-                self->m_isAsynResizing = true; // Ò»Ö¡»æÖÆÍêºó²ÅÔÊĞíresize
+                self->m_isAsynResizing = true; // ä¸€å¸§ç»˜åˆ¶å®Œåæ‰å…è®¸resize
                 ::LeaveCriticalSection(&self->m_clientSizeLock);
 
                 self->m_renderWidgetHostImpl->resizeOnBlinkThread(clientSize.cx, clientSize.cy);
@@ -1248,7 +1252,7 @@ void MbWebView::onMouseMessage(unsigned int message, int x, int y, unsigned int 
     int64_t id = (int64_t)getWebviewHandle();
     blink::CompositorThreadScheduler* compositingThread = blink::ThreadScheduler::CompositorThreadScheduler();
     scoped_refptr<base::SingleThreadTaskRunner> runner = compositingThread->InputTaskRunner();
-    if (m_isPopupWidgetMode) { // µ¯³öµÄÏÂÀ­¿òÖ±½ÓÔÚblinkÏß³ÌÀïÏìÓ¦ÏûÏ¢
+    if (m_isPopupWidgetMode) { // å¼¹å‡ºçš„ä¸‹æ‹‰æ¡†ç›´æ¥åœ¨blinkçº¿ç¨‹é‡Œå“åº”æ¶ˆæ¯
         runner = RenderThreadImpl::get()->getTaskRunner();
     }
 
@@ -1564,7 +1568,7 @@ void MbWebView::onPaint(HWND hWnd, WPARAM wParam)
     if (0 != width && 0 != height) {
 #if defined(OS_WIN)
         if (m_clientResizeRepaintDirty) {
-            //::FillRect(hdc, &ps.rcPaint, (HBRUSH)::GetStockObject(LTGRAY_BRUSH)); // resizeµÄÊ±ºòÉèÖÃÕâ¸ö
+            //::FillRect(hdc, &ps.rcPaint, (HBRUSH)::GetStockObject(LTGRAY_BRUSH)); // resizeçš„æ—¶å€™è®¾ç½®è¿™ä¸ª
             m_clientResizeRepaintDirty = false;
         }
 
@@ -1693,7 +1697,7 @@ void MbWebView::loadUrl(const char* urlStr)
 {
     std::unique_ptr<std::string> urlPtr = urlNormalization(urlStr);
 
-    if (!m_frameClient) { // gtkÄ£Ê½ÏÂ£¬ÓĞ¿ÉÄÜÒªµÈµ½s_gtkActivateÒÔºó²ÅÓĞm_frameClient
+    if (!m_frameClient) { // gtkæ¨¡å¼ä¸‹ï¼Œæœ‰å¯èƒ½è¦ç­‰åˆ°s_gtkActivateä»¥åæ‰æœ‰m_frameClient
         mbWebView webviewHandle = (mbWebView)m_id;
         std::string* urlPtrTemp = urlPtr.release();
         content::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [urlPtrTemp](MbWebView* self) {
@@ -1881,7 +1885,7 @@ bool MbWebView::canGoBack() const
 void MbWebView::didCommitProvisionalLoad(
     blink::WebLocalFrame* frame, const blink::WebHistoryItem& history, blink::WebHistoryCommitType type, bool isSameDocument)
 {
-    m_hasDispatchWillCommitProvisionalLoad = true; // ÓĞµÚÒ»¸öÊı¾İÀ´µ½µÄÊ±ºò»áµ÷ÓÃ
+    m_hasDispatchWillCommitProvisionalLoad = true; // æœ‰ç¬¬ä¸€ä¸ªæ•°æ®æ¥åˆ°çš„æ—¶å€™ä¼šè°ƒç”¨
     m_navigationController->insertOrReplaceEntry(frame, history, type, isSameDocument);
 
     if ((m_renderWidgetHostImpl && m_renderWidgetHostImpl->m_mainFrame == frame) || frame->Top() == frame) {

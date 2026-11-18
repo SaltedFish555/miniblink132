@@ -8,10 +8,15 @@
 #include "content/browser/MbWebview.h"
 #include "content/browser/SharedTimerWin.h"
 #include "content/common/LiveIdDetect.h"
+#include "content/common/StringUtil.h"
 #include "content/common/ThreadCall.h"
 #include "content/common/mbchar.h"
 #include "content/renderer/WebLocalFrameClientImpl.h"
 #include "content/renderer/RenderThreadImpl.h"
+#include "content/renderer/npapi/PluginDatabase.h"
+#include "content/renderer/npapi/PluginQuirkSet.h"
+#include "third_party/blink/renderer/core/exported/web_view_impl.h"
+#include "third_party/blink/renderer/core/page/plugin_data.h"
 #include "mbnet/WebURLLoaderInternal.h"
 #include "mbnet/cookies/WebCookieJarCurlImpl.h"
 #include "third_party/blink/public/web/web_frame_serializer.h"
@@ -163,12 +168,12 @@ typedef enum _MemBufType {
     kMemBufTypeStdString = 110002,
 } MemBufType;
 
-struct MemBufSkdata { // À©Õ¹Ô­°æµÄmbMemBuf£¬ÒÔmbMemBuf::unuse×öÇø·Ö
+struct MemBufSkdata { // æ‰©å±•åŸç‰ˆçš„mbMemBufï¼Œä»¥mbMemBuf::unuseåšåŒºåˆ†
     mbMemBuf buf;
     sk_sp<SkData> skdata;
 };
 
-struct MemBufStdString { // À©Õ¹Ô­°æµÄmbMemBuf£¬ÒÔmbMemBuf::unuse×öÇø·Ö
+struct MemBufStdString { // æ‰©å±•åŸç‰ˆçš„mbMemBufï¼Œä»¥mbMemBuf::unuseåšåŒºåˆ†
     mbMemBuf buf;
     std::string* stdstring;
 };
@@ -335,14 +340,14 @@ void MB_CALL_TYPE mbEnableHighDPISupport()
     float f = display::win::ScreenWin::GetScaleFactorForHWND(NULL);
 
     //HDC screenDC = ::GetDC(nullptr);
-    //int dpiX = ::GetDeviceCaps(screenDC, LOGPIXELSX); // 96?ÊÇ100%¡¢120?ÊÇ125%
+    //int dpiX = ::GetDeviceCaps(screenDC, LOGPIXELSX); // 96?æ˜¯100%ã€120?æ˜¯125%
     content::RenderThreadImpl::get()->setZoom(/*dpiX / 96.0*/f);
 
     //::ReleaseDC(nullptr, screenDC);
 #endif
 }
 
-// ÔİÊ±Ö»ÄÜ»ñÈ¡main world
+// æš‚æ—¶åªèƒ½è·å–main world
 BOOL MB_CALL_TYPE mbGetContextByV8Object(void* isolate, void* obj, int worldID, v8ContextPtr cxtOut)
 {
     v8::Local<v8::Object>* object = (v8::Local<v8::Object>*)obj;
@@ -428,7 +433,7 @@ void MB_CALL_TYPE mbGetWorldScriptContextByWebFrame(mbWebView webviewHandle, mbW
         return;
 
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    // ²»ĞèÒªv8::HandleScope£¬ÒòÎªÕâ¸ö»áµ¼ÖÂv8::ContextÒ»·µ»Ø¾ÍÊ§Ğ§ÁË
+    // ä¸éœ€è¦v8::HandleScopeï¼Œå› ä¸ºè¿™ä¸ªä¼šå¯¼è‡´v8::Contextä¸€è¿”å›å°±å¤±æ•ˆäº†
 
     blink::WebLocalFrame* webFrame = nullptr;
     if ((mbWebFrameHandle)-2 == frameId) {
@@ -595,7 +600,15 @@ void MB_CALL_TYPE mbSetLanguage(mbWebView webviewHandle, const char* language)
 }
 void MB_CALL_TYPE mbAddPluginDirectory(mbWebView webviewHandle, const WCHAR* path)
 {
-    OutputDebugStringA("mbAddPluginDirectory not impl\n");
+    if (!path || !path[0])
+        return;
+    std::string dirUtf8 = content::utf16ToUtf8(path);
+    if (dirUtf8.empty())
+        return;
+    content::ThreadCall::callBlinkThreadAsync(MB_FROM_HERE, [dirUtf8]() {
+        content::PluginDatabase::installedPlugins()->addExtraPluginDirectory(WTF::String::FromUTF8(dirUtf8));
+        blink::PluginData::RefreshBrowserSidePluginCache();
+    });
 }
 
 void MB_CALL_TYPE mbSetDiskCacheEnabled(mbWebView webviewHandle, BOOL enable)
@@ -670,22 +683,28 @@ void MB_CALL_TYPE mbSetDragEnable(mbWebView webviewHandle, BOOL b)
 
 void MB_CALL_TYPE mbSetHandleOffset(mbWebView webviewHandle, int x, int y)
 {
-    OutputDebugStringA("mbSetHandleOffset not impl\n");
-//     checkThreadCallIsValid(__FUNCTION__);
-// 
-//     mb::MbWebView* webview = (mb::MbWebView*)common::LiveIdDetect::get()->getPtr((int64_t)webviewHandle);
-//     if (!webview)
-//         return;
-//     webview->setOffset(x, y);
-// 
-//     common::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [x, y](mb::MbWebView* webview) {
-//         wkeSetHandleOffset(webview->getWkeWebView(), x, y);
-//         });
+    content::MbWebView* webview = (content::MbWebView*)common::LiveIdDetect::getMbWebviewIds()->getPtr((int64_t)webviewHandle);
+    if (!webview)
+        return;
+    webview->setOffset(x, y);
 }
 
 void MB_CALL_TYPE mbSetNpapiPluginsEnabled(mbWebView webviewHandle, BOOL b)
 {
-    OutputDebugStringA("mbSetNpapiPluginsEnabled not impl\n");
+    bool enabled = !!b;
+    content::setNpapiPluginsEnabled(enabled);
+    if (!webviewHandle)
+        return;
+    content::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [enabled](content::MbWebView* self) {
+        blink::WebViewImpl* webView = static_cast<blink::WebViewImpl*>(self->getWebView());
+        if (webView) {
+            blink::web_pref::WebPreferences prefs = webView->GetWebPreferences();
+            prefs.plugins_enabled = enabled;
+            prefs.allow_non_empty_navigator_plugins = enabled;
+            webView->SetWebPreferences(prefs);
+        }
+        blink::PluginData::RefreshBrowserSidePluginCache();
+    });
 }
 
 void MB_CALL_TYPE mbSetMemoryCacheEnable(mbWebView webviewHandle, BOOL b)

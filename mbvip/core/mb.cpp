@@ -14,6 +14,9 @@
 #include "content/common/mbchar.h"
 #include "content/renderer/RenderThreadImpl.h"
 #include "content/renderer/RendererBlinkPlatformImpl.h"
+#include "content/renderer/npapi/PluginQuirkSet.h"
+#include "base/files/file_path.h"
+#include "third_party/blink/public/mojom/plugins/plugin_registry.mojom-blink.h"
 #include "mbnet/WebURLLoaderInternal.h"
 #include "mbnet/cookies/WebCookieJarCurlImpl.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
@@ -63,9 +66,9 @@ static bool checkThreadCallIsValidImpl(const char* funcName, bool isBlinkThread)
     return true;
     //     std::u16string textMsg;
     //     if (!g_mbIsInit) {
-    //         textMsg = u16("½ûÖ¹Î´³õÊ¼»¯µ÷ÓÃ´Ë½Ó¿Ú£º");
+    //         textMsg = u16("ç¦æ­¢æœªåˆå§‹åŒ–è°ƒç”¨æ­¤æ¥å£ï¼š");
     //         textMsg += common::utf8ToUtf16(funcName);
-    //         ::MessageBoxW(nullptr, textMsg.c_str(), u16("¾¯¸æ"), MB_OK);
+    //         ::MessageBoxW(nullptr, textMsg.c_str(), u16("è­¦å‘Š"), MB_OK);
     //         ::TerminateProcess((HANDLE)-1, 5);
     //         return false;
     //     }
@@ -79,16 +82,16 @@ static bool checkThreadCallIsValidImpl(const char* funcName, bool isBlinkThread)
     //     }
     //
     // #if defined(OS_WIN)
-    //     textMsg = u16("½ûÖ¹¿çÏß³Ìµ÷ÓÃ´Ë½Ó¿Ú£º");
+    //     textMsg = u16("ç¦æ­¢è·¨çº¿ç¨‹è°ƒç”¨æ­¤æ¥å£ï¼š");
     //     textMsg += common::utf8ToUtf16(funcName);
-    //     textMsg += u16("£¬");
+    //     textMsg += u16("ï¼Œ");
     //
     //     WCHAR* temp = (WCHAR*)malloc(0x200);
-    //     wsprintf(temp, u16("µ±Ç°Ïß³Ì:%d£¬Ö÷Ïß³Ì£º%d"), ::GetCurrentThreadId(), common::ThreadCall::getUiThreadId());
+    //     wsprintf(temp, u16("å½“å‰çº¿ç¨‹:%dï¼Œä¸»çº¿ç¨‹ï¼š%d"), ::GetCurrentThreadId(), common::ThreadCall::getUiThreadId());
     //     textMsg += temp;
     //     free(temp);
     //
-    //     ::MessageBoxW(nullptr, textMsg.c_str(), u16("¾¯¸æ"), MB_OK);
+    //     ::MessageBoxW(nullptr, textMsg.c_str(), u16("è­¦å‘Š"), MB_OK);
     // #else
     //     printf("function: %s, current thread:%u, main thread:%u", funcName, ::GetCurrentThreadId(), common::ThreadCall::getUiThreadId());
     // #endif
@@ -120,7 +123,7 @@ mbWebView MB_CALL_TYPE mbCreateWebView()
     checkThreadCallIsValid(__FUNCTION__);
     content::MbWebView* result = new content::MbWebView(false);
 
-    // Ö®ËùÒÔÒªÇ¶Ì×Ò»²ã£¬ÊÇÎªÁËÈÃisTransparent»ñÈ¡µ½Íâ²¿½ÓÏÂÀ´¿ÉÄÜÉèÖÃmbSetTransparentµÄÖµ
+    // ä¹‹æ‰€ä»¥è¦åµŒå¥—ä¸€å±‚ï¼Œæ˜¯ä¸ºäº†è®©isTransparentè·å–åˆ°å¤–éƒ¨æ¥ä¸‹æ¥å¯èƒ½è®¾ç½®mbSetTransparentçš„å€¼
     content::ThreadCall::callUiThreadAsync(MB_FROM_HERE, [result] {
         content::ThreadCall::callBlinkThreadAsync(
             MB_FROM_HERE, [result] { result->createWebWindowOrViewInBlinkThread(nullptr, nullptr, false, result->isTransparent()); });
@@ -154,7 +157,7 @@ mbWebView MB_CALL_TYPE mbCreateWebWindow(mbWindowType type, HWND parent, int x, 
 
 #ifndef OS_WIN
     if (type == MB_WINDOW_TYPE_TRANSPARENT)
-        type = MB_WINDOW_TYPE_POPUP; // linuxÏÂÃ»ÓĞÍ¸Ã÷´°¿Ú
+        type = MB_WINDOW_TYPE_POPUP; // linuxä¸‹æ²¡æœ‰é€æ˜çª—å£
 #endif // OS_WIN
 
     if (!s_gtkActivate) {
@@ -166,7 +169,7 @@ mbWebView MB_CALL_TYPE mbCreateWebWindow(mbWindowType type, HWND parent, int x, 
     return (int)result->getId();
 }
 
-// ¼æÈİmbcef°æ±¾
+// å…¼å®¹mbcefç‰ˆæœ¬
 mbWebView MB_CALL_TYPE mbCreateWebWindowEx(mbWindowType type, HWND parent, int x, int y, int width, int height, const mbViewSettings* settings)
 {
     mbWebView webview = mbCreateWebWindow(type, parent, x, y, width, height);
@@ -210,7 +213,7 @@ void MB_CALL_TYPE mbSetHandle(mbWebView webviewHandle, HWND wnd)
     checkThreadCallIsValid(__FUNCTION__);
 
     content::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [wnd](content::MbWebView* webview) {
-        webview->setHostWnd(wnd); // ±ØĞëÔÚÕâÉèÖÃ£¬²»ÄÜ·Å±Õ°üÍâ¡£ÄÇÑù»áµ¼ÖÂÌáÇ°ÉèÖÃµÄmbSetDragDropEnableÎŞĞ§£¬´Ó¶øµ¼ÖÂRegisterDragDrop±»ÉèÖÃ
+        webview->setHostWnd(wnd); // å¿…é¡»åœ¨è¿™è®¾ç½®ï¼Œä¸èƒ½æ”¾é—­åŒ…å¤–ã€‚é‚£æ ·ä¼šå¯¼è‡´æå‰è®¾ç½®çš„mbSetDragDropEnableæ— æ•ˆï¼Œä»è€Œå¯¼è‡´RegisterDragDropè¢«è®¾ç½®
     });
 }
 
@@ -717,10 +720,7 @@ BOOL MB_CALL_TYPE mbOnDestroy(mbWebView webviewHandle, mbDestroyCallback callbac
 
 void MB_CALL_TYPE mbOnPluginList(mbWebView webviewHandle, mbGetPluginListCallback callback, void* param)
 {
-//     mb::MbWebView* webview = (mb::MbWebView*)common::LiveIdDetect::get()->getPtr(webviewHandle);
-//     if (!webview)
-//         return;
-//     wkeSetDebugConfig(nullptr, "setPluginListCallback", (const char*)callback);
+    content::setNpapiPluginListCallback(callback, param);
 }
 
 BOOL MB_CALL_TYPE mbOnPrinting(mbWebView webviewHandle, mbPrintingCallback callback, void* param)
@@ -1070,7 +1070,7 @@ void MB_CALL_TYPE mbWake(mbWebView webviewHandle)
     content::ThreadCall::wake();
 }
 
-// ±¾º¯ÊıÓĞ¿ÉÄÜÔÚblinkÏß³Ì£¨ÀıÈçjsÀïÓÃcloseµ÷ÓÃ£©
+// æœ¬å‡½æ•°æœ‰å¯èƒ½åœ¨blinkçº¿ç¨‹ï¼ˆä¾‹å¦‚jsé‡Œç”¨closeè°ƒç”¨ï¼‰
 void mbDestroyWebViewImpl(mbWebView webviewHandle)
 {
     checkThreadCallIsValid(__FUNCTION__);
@@ -1477,20 +1477,35 @@ void MB_CALL_TYPE mbGetPdfPageData(mbWebView webviewHandle, mbOnGetPdfPageDataCa
 
 void MB_CALL_TYPE mbPluginListBuilderAddPlugin(void* builder, const utf8* name, const utf8* description, const utf8* fileName)
 {
-    OutputDebugStringA("mbPluginListBuilderAddPlugin not impl\n");
-    *(int*)1 = 1;
+    auto* plugins = static_cast<WTF::Vector<::blink::mojom::blink::PluginInfoPtr>*>(builder);
+    if (!plugins)
+        return;
+    auto info = ::blink::mojom::blink::PluginInfo::New();
+    info->name = WTF::String::FromUTF8(name ? name : "");
+    info->description = WTF::String::FromUTF8(description ? description : "");
+    info->filename = base::FilePath::FromUTF8Unsafe(fileName ? fileName : "");
+    info->background_color = 0xFFFFFFFF;
+    info->may_use_external_handler = false;
+    plugins->push_back(std::move(info));
 }
 
 void MB_CALL_TYPE mbPluginListBuilderAddMediaTypeToLastPlugin(void* builder, const utf8* name, const utf8* description)
 {
-    OutputDebugStringA("mbPluginListBuilderAddMediaTypeToLastPlugin not impl\n");
-    *(int*)1 = 1;
+    auto* plugins = static_cast<WTF::Vector<::blink::mojom::blink::PluginInfoPtr>*>(builder);
+    if (!plugins || plugins->empty())
+        return;
+    auto mime = ::blink::mojom::blink::PluginMimeType::New();
+    mime->mime_type = WTF::String::FromUTF8(name ? name : "");
+    mime->description = WTF::String::FromUTF8(description ? description : "");
+    plugins->back()->mime_types.push_back(std::move(mime));
 }
 
 void MB_CALL_TYPE mbPluginListBuilderAddFileExtensionToLastMediaType(void* builder, const utf8* fileExtension)
 {
-    OutputDebugStringA("mbPluginListBuilderAddFileExtensionToLastMediaType not impl\n");
-    *(int*)1 = 1;
+    auto* plugins = static_cast<WTF::Vector<::blink::mojom::blink::PluginInfoPtr>*>(builder);
+    if (!plugins || plugins->empty() || plugins->back()->mime_types.empty())
+        return;
+    plugins->back()->mime_types.back()->file_extensions.push_back(WTF::String::FromUTF8(fileExtension ? fileExtension : ""));
 }
 
 void MB_CALL_TYPE mbOnLoadUrlFinish(mbWebView webView, mbLoadUrlFinishCallback callback, void* callbackParam)
@@ -1614,21 +1629,21 @@ void gtkSimpleWin()
     GtkWidget* label;
     GtkWidget* grid;
 
-    // ´´½¨Ò»¸öĞÂ´°¿Ú£¬²¢ÉèÖÃÆä±êÌâºÍÄ¬ÈÏ´óĞ¡
+    // åˆ›å»ºä¸€ä¸ªæ–°çª—å£ï¼Œå¹¶è®¾ç½®å…¶æ ‡é¢˜å’Œé»˜è®¤å¤§å°
     //window = gtk_application_window_new(app);
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "Simple GTK3 Window");
     gtk_window_set_default_size(GTK_WINDOW(window), 300, 200);
 
-    // ´´½¨Ò»¸öÍø¸ñÈİÆ÷
+    // åˆ›å»ºä¸€ä¸ªç½‘æ ¼å®¹å™¨
     grid = gtk_grid_new();
     gtk_container_add(GTK_CONTAINER(window), grid);
 
-    // ´´½¨Ò»¸ö±êÇ©£¬²¢ÉèÖÃÒªÏÔÊ¾µÄÎÄ×Ö
+    // åˆ›å»ºä¸€ä¸ªæ ‡ç­¾ï¼Œå¹¶è®¾ç½®è¦æ˜¾ç¤ºçš„æ–‡å­—
     label = gtk_label_new("Hello, this is a simple GTK3 window!");
     gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
 
-    // ÏÔÊ¾ËùÓĞµÄ²¿¼ş
+    // æ˜¾ç¤ºæ‰€æœ‰çš„éƒ¨ä»¶
     gtk_widget_show_all(window);
 #endif
 }
@@ -2084,7 +2099,7 @@ void mbSetProxy(mbWebView webviewHandle, const mbProxy* proxy)
 
 void setFullPath(mbWebView webviewHandle, const WCHAR* path, bool isCookiePath);
 
-// ÕâÁ½apiÈç¹ûÔÚblinkÏß³Ì±»µ÷ÓÃ£¬±ØĞëÁ¢¿ÌÖ´ĞĞ¡£·ñÔò»á²úÉúÀÏcookie\storageÂ·¾¶ÎÄ¼ş
+// è¿™ä¸¤apiå¦‚æœåœ¨blinkçº¿ç¨‹è¢«è°ƒç”¨ï¼Œå¿…é¡»ç«‹åˆ»æ‰§è¡Œã€‚å¦åˆ™ä¼šäº§ç”Ÿè€cookie\storageè·¯å¾„æ–‡ä»¶
 void MB_CALL_TYPE mbSetLocalStorageFullPath(mbWebView webviewHandle, const WCHAR* path)
 {
     setFullPath(webviewHandle, path, false);
