@@ -4,4 +4,9 @@
     <!--<LLVMToolsVersion>18.1.8</LLVMToolsVersion>-->
     <LLVMToolsVersion>18</LLVMToolsVersion>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <ForcedIncludeFiles>$(MSBuildThisFileDirectory)stl_compat_shim.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
+  </ItemDefinitionGroup>
 </Project>

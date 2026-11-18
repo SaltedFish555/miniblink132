@@ -8,6 +8,7 @@
 #include <dwrite.h>
 
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "base/component_export.h"
