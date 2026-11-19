@@ -224,22 +224,22 @@ void _NPN_UnregisterObject(NPObject* npObject)
         return;
 
     NPObject* owner = liveIt->second;
+    liveObjectMap().erase(liveIt);
+
     if (!owner) {
         auto rootIt = rootObjectMap().find(npObject);
         if (rootIt != rootObjectMap().end()) {
             NPObjectSet* set = rootIt->second;
+            rootObjectMap().erase(rootIt);
             while (!set->empty()) {
                 NPObject* subObject = *set->begin();
                 set->erase(subObject);
                 liveObjectMap().erase(subObject);
 
-                if (content::V8NPObject* v8npObject = content::npObjectToV8NPObject(subObject))
-                    v8npObject->rootFrame = nullptr;
-
+                content::disposeV8NPObject(subObject);
                 content::forgetV8ObjectForNPObject(subObject);
             }
             delete set;
-            rootObjectMap().erase(rootIt);
         }
     } else {
         auto rootIt = rootObjectMap().find(owner);
@@ -247,7 +247,7 @@ void _NPN_UnregisterObject(NPObject* npObject)
             rootIt->second->erase(npObject);
     }
 
-    liveObjectMap().erase(npObject);
+    content::disposeV8NPObject(npObject);
     content::forgetV8ObjectForNPObject(npObject);
 }
 

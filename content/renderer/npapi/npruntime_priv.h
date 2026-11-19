@@ -68,6 +68,7 @@ struct V8NPObject {
     v8::Global<v8::Context> v8Context;
     blink::WebLocalFrame* rootFrame = nullptr;
     int64_t mbwebviewId = 0;
+    int identityHash = 0;
 };
 
 NPIdentifier getStringIdentifierFromV8(v8::Isolate* isolate, v8::Local<v8::String> str);
@@ -77,6 +78,7 @@ v8::Local<v8::Value> convertNPVariantToV8Object(v8::Isolate* isolate, v8::Local<
 NPObject* npCreateV8ScriptObject(
     v8::Isolate* isolate, v8::Local<v8::Context> context, NPP npp, v8::Local<v8::Object> object, blink::WebLocalFrame* rootFrame, int64_t mbwebviewId);
 V8NPObject* npObjectToV8NPObject(NPObject* npObject);
+void disposeV8NPObject(NPObject* npObject);
 NPObject* v8ObjectToNPObject(v8::Local<v8::Object> object);
 bool isWrappedNPObject(v8::Local<v8::Object> object);
 
