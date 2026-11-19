@@ -3,7 +3,9 @@
 
 #include "content/renderer/npapi/WebPluginImpl.h"
 
+#include <algorithm>
 #include <cstring>
+#include <string_view>
 
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
@@ -11,8 +13,12 @@
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
 #include "content/renderer/npapi/npruntime_priv.h"
+#include "net/http/http_request_headers.h"
+#include "services/network/public/cpp/data_element.h"
 #include "services/network/public/cpp/resource_request_body.h"
 #include "third_party/blink/public/platform/platform.h"
+#include "third_party/blink/public/platform/web_data.h"
+#include "third_party/blink/public/platform/web_http_body.h"
 #include "third_party/blink/public/platform/web_url_request.h"
 #include "third_party/blink/public/web/web_document.h"
 #include "third_party/blink/public/web/web_plugin_container.h"
@@ -21,6 +27,36 @@
 namespace content {
 
 namespace {
+
+int hexCharToInt(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
+}
+
+std::string percentDecode(std::string_view input)
+{
+    std::string out;
+    out.reserve(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size()) {
+            int hi = hexCharToInt(input[i + 1]);
+            int lo = hexCharToInt(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(input[i]);
+    }
+    return out;
+}
 
 blink::KURL makePluginURL(const blink::KURL& baseURL, const char* relativeURLString)
 {
@@ -32,24 +68,27 @@ blink::KURL makePluginURL(const blink::KURL& baseURL, const char* relativeURLStr
 
 int locationAfterFirstBlankLine(const std::vector<char>& buffer)
 {
-    if (buffer.size() < 4)
+    std::string_view sv(buffer.data(), buffer.size());
+    if (sv.empty())
         return -1;
-    const char* bytes = buffer.data();
-    size_t length = buffer.size();
-    for (size_t i = 0; i + 4 <= length; ++i) {
-        if (bytes[i] == '\n' && bytes[i + 1] == '\n')
-            return static_cast<int>(i + 2);
-        if (bytes[i] == '\r' && bytes[i + 1] == '\n') {
-            i += 2;
-            if (i == 2)
-                return static_cast<int>(i);
-            if (bytes[i] == '\n')
-                return static_cast<int>(i + 1);
-            if (bytes[i] == '\r' && bytes[i + 1] == '\n')
-                return static_cast<int>(i + 2);
-        }
-    }
-    return -1;
+    if (sv.size() >= 2 && sv[0] == '\r' && sv[1] == '\n')
+        return 2;
+    if (sv[0] == '\n')
+        return 1;
+
+    size_t posCRLF = sv.find("\r\n\r\n");
+    size_t posLF = sv.find("\n\n");
+    size_t posCRLF_LF = sv.find("\r\n\n");
+
+    size_t bestEnd = std::string_view::npos;
+    if (posCRLF != std::string_view::npos)
+        bestEnd = std::min(bestEnd, posCRLF + 4);
+    if (posLF != std::string_view::npos)
+        bestEnd = std::min(bestEnd, posLF + 2);
+    if (posCRLF_LF != std::string_view::npos)
+        bestEnd = std::min(bestEnd, posCRLF_LF + 3);
+
+    return (bestEnd == std::string_view::npos) ? -1 : static_cast<int>(bestEnd);
 }
 
 void parsePostHeaderFields(const char* bytes, size_t length, net::HttpRequestHeaders* outHeaders)
@@ -128,24 +167,31 @@ void WebPluginImpl::performRequest(std::unique_ptr<PluginRequest> req)
     std::string urlSpec = req->request->url.possibly_invalid_spec();
 
     if (base::StartsWith(urlSpec, "javascript:", base::CompareCase::INSENSITIVE_ASCII)) {
-        std::string jsCode = urlSpec.substr(11);
+        std::string jsCode = percentDecode(std::string_view(urlSpec).substr(11));
         NPString npScript { jsCode.c_str(), static_cast<uint32_t>(jsCode.size()) };
         NPVariant evalResult;
         VOID_TO_NPVARIANT(evalResult);
         _NPN_EvaluateHelper(m_instance, req->shouldAllowPopups, windowScriptNPObject(), &npScript, &evalResult);
 
-        if (req->targetFrameName.empty()) {
-            std::string jsStr;
-            if (NPVARIANT_IS_STRING(evalResult)) {
-                NPString s = NPVARIANT_TO_STRING(evalResult);
-                if (s.UTF8Characters && s.UTF8Length > 0)
-                    jsStr.assign(s.UTF8Characters, s.UTF8Length);
+        if (m_isStarted && m_plugin && m_instance) {
+            if (req->targetFrameName.empty()) {
+                std::string jsStr;
+                if (NPVARIANT_IS_STRING(evalResult)) {
+                    NPString s = NPVARIANT_TO_STRING(evalResult);
+                    if (s.UTF8Characters && s.UTF8Length > 0)
+                        jsStr.assign(s.UTF8Characters, s.UTF8Length);
+                }
+                blink::KURL kurl(WTF::String::FromUTF8(urlSpec));
+                auto stream = PluginStream::create(this, m_mbwebviewId, std::move(req->request), nullptr,
+                    req->sendNotification, req->notifyData, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
+                m_streams.insert(stream);
+                stream->sendJavaScriptStream(kurl, jsStr);
+            } else if (req->sendNotification && m_plugin->pluginFuncs()->urlnotify) {
+                ScopedCurrentPluginView currentGuard(this);
+                setCallingPlugin(true);
+                m_plugin->pluginFuncs()->urlnotify(m_instance, urlSpec.c_str(), NPRES_DONE, req->notifyData);
+                setCallingPlugin(false);
             }
-            blink::KURL kurl(WTF::String::FromUTF8(urlSpec));
-            auto stream = PluginStream::create(this, m_mbwebviewId, std::move(req->request), nullptr,
-                req->sendNotification, req->notifyData, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
-            m_streams.insert(stream);
-            stream->sendJavaScriptStream(kurl, jsStr);
         }
         _NPN_ReleaseVariantValue(&evalResult);
         return;
@@ -161,13 +207,32 @@ void WebPluginImpl::performRequest(std::unique_ptr<PluginRequest> req)
     } else if (m_pluginContainer) {
         blink::WebURLRequest webReq(blink::KURL(WTF::String::FromUTF8(urlSpec)));
         webReq.SetHttpMethod(blink::WebString::FromUTF8(req->request->method));
+        net::HttpRequestHeaders::Iterator headerIt(req->request->headers);
+        while (headerIt.GetNext()) {
+            webReq.AddHttpHeaderField(
+                blink::WebString::FromUTF8(headerIt.name()),
+                blink::WebString::FromUTF8(headerIt.value()));
+        }
+        if (req->request->request_body && req->request->request_body->elements()) {
+            blink::WebHTTPBody httpBody;
+            httpBody.Initialize();
+            bool hasBody = false;
+            for (const network::DataElement& elem : *req->request->request_body->elements()) {
+                if (elem.type() == network::DataElement::Tag::kBytes) {
+                    std::string_view sv = elem.As<network::DataElementBytes>().AsStringPiece();
+                    httpBody.AppendData(blink::WebData(sv.data(), sv.size()));
+                    hasBody = true;
+                }
+            }
+            if (hasBody)
+                webReq.SetHttpBody(httpBody);
+        }
         m_pluginContainer->LoadFrameRequest(webReq, blink::WebString::FromUTF8(req->targetFrameName));
-        if (req->sendNotification && m_plugin->pluginFuncs()->urlnotify) {
-            setCurrentPluginView(this);
+        if (m_isStarted && req->sendNotification && m_plugin && m_plugin->pluginFuncs()->urlnotify && m_instance) {
+            ScopedCurrentPluginView currentGuard(this);
             setCallingPlugin(true);
             m_plugin->pluginFuncs()->urlnotify(m_instance, urlSpec.c_str(), NPRES_DONE, req->notifyData);
             setCallingPlugin(false);
-            setCurrentPluginView(nullptr);
         }
     }
 }
@@ -211,8 +276,12 @@ NPError WebPluginImpl::postURL(const char* url, const char* target, uint32_t len
 NPError WebPluginImpl::handlePostReadFile(std::vector<char>& buffer, uint32_t len, const char* buf)
 {
     std::string filename(buf, len);
-    if (base::StartsWith(filename, "file:///", base::CompareCase::INSENSITIVE_ASCII))
+    while (!filename.empty() && filename.back() == '\0')
+        filename.pop_back();
+    if (base::StartsWith(filename, "file:///", base::CompareCase::INSENSITIVE_ASCII)) {
         filename.erase(0, 8);
+        filename = percentDecode(filename);
+    }
 
     base::FilePath path = base::FilePath::FromUTF8Unsafe(filename);
     std::string contents;
@@ -298,6 +367,8 @@ void WebPluginImpl::DidReceiveResponse(const blink::WebURLResponse& response)
 {
     if (m_status != PluginStatusLoadedSuccessfully || !m_plugin)
         return;
+
+    registerManualPlugin();
 
     auto req = std::make_unique<network::ResourceRequest>();
     req->method = "GET";
