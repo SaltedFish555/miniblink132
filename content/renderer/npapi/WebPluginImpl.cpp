@@ -48,6 +48,12 @@ std::map<NPP, WebPluginImpl*>& instanceMap()
     return *s_map;
 }
 
+std::map<blink::WebLocalFrame*, std::set<WebPluginImpl*>>& manualPluginsByFrame()
+{
+    static auto* s_map = new std::map<blink::WebLocalFrame*, std::set<WebPluginImpl*>>();
+    return *s_map;
+}
+
 char* dupUtf8String(const std::string& str)
 {
     char* out = static_cast<char*>(malloc(str.size() + 1));
@@ -56,8 +62,9 @@ char* dupUtf8String(const std::string& str)
     return out;
 }
 
-void deferredDestroyPluginInstance(NPP_DestroyProcPtr destroyFunc, NPP instance)
+void deferredDestroyPluginInstance(scoped_refptr<PluginPackage> plugin, bool shouldUnload, NPP instance)
 {
+    NPP_DestroyProcPtr destroyFunc = plugin ? plugin->pluginFuncs()->destroy : nullptr;
     if (destroyFunc && instance) {
         NPSavedData* savedData = nullptr;
         destroyFunc(instance, &savedData);
@@ -69,6 +76,8 @@ void deferredDestroyPluginInstance(NPP_DestroyProcPtr destroyFunc, NPP instance)
         instance->pdata = nullptr;
     }
     delete instance;
+    if (shouldUnload && plugin)
+        plugin->unload();
 }
 
 } // namespace
@@ -110,6 +119,7 @@ WebPluginImpl::WebPluginImpl(blink::WebLocalFrame* parentFrame, const blink::Web
 
 WebPluginImpl::~WebPluginImpl()
 {
+    unregisterManualPlugin();
     if (m_instance) {
         instanceMap().erase(m_instance);
         delete m_instance;
@@ -117,6 +127,43 @@ WebPluginImpl::~WebPluginImpl()
     }
     freeStringArray(m_paramNames, m_paramCount);
     freeStringArray(m_paramValues, m_paramCount);
+}
+
+void WebPluginImpl::registerManualPlugin()
+{
+    if (m_loadManually && m_webFrame)
+        manualPluginsByFrame()[m_webFrame].insert(this);
+}
+
+void WebPluginImpl::unregisterManualPlugin()
+{
+    if (!m_webFrame)
+        return;
+    auto& byFrame = manualPluginsByFrame();
+    auto it = byFrame.find(m_webFrame);
+    if (it != byFrame.end()) {
+        it->second.erase(this);
+        if (it->second.empty())
+            byFrame.erase(it);
+    }
+}
+
+void WebPluginImpl::notifyManualLoadFinishedForFrame(blink::WebLocalFrame* frame)
+{
+    if (!frame)
+        return;
+    auto& byFrame = manualPluginsByFrame();
+    auto it = byFrame.find(frame);
+    if (it == byFrame.end() || it->second.empty())
+        return;
+
+    std::vector<scoped_refptr<WebPluginImpl>> plugins;
+    plugins.reserve(it->second.size());
+    for (WebPluginImpl* plugin : it->second)
+        plugins.emplace_back(plugin);
+
+    for (const auto& plugin : plugins)
+        plugin->DidFinishLoading();
 }
 
 bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
@@ -239,12 +286,17 @@ bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
 
 void WebPluginImpl::Destroy()
 {
+    unregisterManualPlugin();
     m_requestTimer.Stop();
     m_invalidateTimer.Stop();
     m_popPopupsStateTimer.Stop();
     m_visibilityTimer.Stop();
 
     stop();
+    if (m_hasLoadedPlugin && m_plugin) {
+        m_plugin->unload();
+        m_hasLoadedPlugin = false;
+    }
     platformDestroy();
 
     if (m_windowNPObject) {
@@ -277,8 +329,11 @@ void WebPluginImpl::init()
         m_status = PluginStatusCanNotLoadPlugin;
         return;
     }
+    m_hasLoadedPlugin = true;
 
     if (!start()) {
+        m_plugin->unload();
+        m_hasLoadedPlugin = false;
         m_status = PluginStatusCanNotLoadPlugin;
         return;
     }
@@ -297,12 +352,11 @@ bool WebPluginImpl::start()
 
     NPError npErr = NPERR_GENERIC_ERROR;
     {
-        setCurrentPluginView(this);
+        ScopedCurrentPluginView currentGuard(this);
         setCallingPlugin(true);
         npErr = m_plugin->pluginFuncs()->newp(
             const_cast<NPMIMEType>(m_mimeType.c_str()), m_instance, m_mode, m_paramCount, m_paramNames, m_paramValues, nullptr);
         setCallingPlugin(false);
-        setCurrentPluginView(nullptr);
     }
 
     if (npErr != NPERR_NO_ERROR) {
@@ -359,27 +413,26 @@ void WebPluginImpl::stop()
 
     m_npWindow.window = nullptr;
     if (m_plugin && m_plugin->pluginFuncs()->setwindow && !m_plugin->quirks().contains(PluginQuirkDontSetNullWindowHandleOnDestroy)) {
-        setCurrentPluginView(this);
+        ScopedCurrentPluginView currentGuard(this);
         setCallingPlugin(true);
         m_plugin->pluginFuncs()->setwindow(m_instance, &m_npWindow);
         setCallingPlugin(false);
-        setCurrentPluginView(nullptr);
     }
 
     PluginMainThreadScheduler::scheduler().unregisterPlugin(m_instance);
 
     // Defer NPP_Destroy to the next task turn so tearing down from inside _NPN_Evaluate never crashes.
+    // Keep m_plugin alive until NPP_Destroy finishes, then pair unload() with load().
     NPP instanceToDestroy = m_instance;
     m_instance = nullptr;
     if (instanceToDestroy) {
         instanceMap().erase(instanceToDestroy);
         instanceToDestroy->ndata = nullptr;
-        NPP_DestroyProcPtr destroyFn = m_plugin ? m_plugin->pluginFuncs()->destroy : nullptr;
-        uintptr_t destroyFnAddr = reinterpret_cast<uintptr_t>(destroyFn);
+        scoped_refptr<PluginPackage> pkg = m_plugin;
+        bool shouldUnload = m_hasLoadedPlugin;
+        m_hasLoadedPlugin = false;
         base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-            FROM_HERE, base::BindOnce([](uintptr_t fnAddr, NPP inst) {
-                deferredDestroyPluginInstance(reinterpret_cast<NPP_DestroyProcPtr>(fnAddr), inst);
-            }, destroyFnAddr, instanceToDestroy));
+            FROM_HERE, base::BindOnce(&deferredDestroyPluginInstance, std::move(pkg), shouldUnload, instanceToDestroy));
     }
 }
 
@@ -394,7 +447,8 @@ void WebPluginImpl::findVirtualPluginByMime()
             break;
         if (!m_plugin->load())
             continue;
-        if (m_plugin->pluginFuncs()->newp(const_cast<NPMIMEType>(m_mimeType.c_str()), nullptr, 0, 0, nullptr, nullptr, nullptr) == NPERR_NO_ERROR)
+        if (m_plugin->pluginFuncs()->newp
+            && m_plugin->pluginFuncs()->newp(const_cast<NPMIMEType>(m_mimeType.c_str()), nullptr, 0, 0, nullptr, nullptr, nullptr) == NPERR_NO_ERROR)
             break;
     }
 }
@@ -517,11 +571,10 @@ NPObject* WebPluginImpl::npObject()
     NPObject* object = nullptr;
     NPError npErr = NPERR_GENERIC_ERROR;
     {
-        setCurrentPluginView(this);
+        ScopedCurrentPluginView currentGuard(this);
         setCallingPlugin(true);
         npErr = m_plugin->pluginFuncs()->getvalue(m_instance, NPPVpluginScriptableNPObject, &object);
         setCallingPlugin(false);
-        setCurrentPluginView(nullptr);
     }
     return (npErr == NPERR_NO_ERROR) ? object : nullptr;
 }

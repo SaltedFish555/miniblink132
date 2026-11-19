@@ -110,6 +110,7 @@ private:
     bool m_sendNotification = false;
     PluginStreamState m_streamState = StreamBeforeStarted;
     bool m_loadManually = false;
+    bool m_isDeliveringData = false;
 
     std::vector<char> m_deliveryData;
     base::OneShotTimer m_delayDeliveryTimer;

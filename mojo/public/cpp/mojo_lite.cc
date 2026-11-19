@@ -2468,10 +2468,11 @@ void mojo::DataPipeDrainer::ReadData()
         MojoResult rv = source_->BeginReadData(MOJO_READ_DATA_FLAG_NONE, buffer);
         if (rv == MOJO_RESULT_OK) {
             size_t numBytes = buffer.size();
-            client_->OnDataAvailable(buffer);
+            std::vector<uint8_t> copy(buffer.begin(), buffer.end());
+            source_->EndReadData(numBytes);
+            client_->OnDataAvailable(base::span<const uint8_t>(copy.data(), copy.size()));
             if (!self || !source_.is_valid())
                 return;
-            source_->EndReadData(numBytes);
         } else if (rv == MOJO_RESULT_FAILED_PRECONDITION) {
             handle_watcher_.Cancel();
             client_->OnDataComplete();

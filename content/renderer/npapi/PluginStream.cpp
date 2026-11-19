@@ -108,6 +108,7 @@ void PluginStream::start()
 
 void PluginStream::stop()
 {
+    scoped_refptr<PluginStream> protect(this);
     m_streamState = StreamStopped;
     m_delayDeliveryTimer.Stop();
     if (m_bodyWatcher) {
@@ -116,7 +117,15 @@ void PluginStream::stop()
     }
     m_bodyPipe.reset();
     m_loader.reset();
+    m_deliveryData.clear();
+    if (m_tempFile.IsValid())
+        m_tempFile.Close();
+    if (!m_tempFilePath.empty()) {
+        base::DeleteFile(m_tempFilePath);
+        m_tempFilePath.clear();
+    }
     m_client = nullptr;
+    m_keepAlive.reset();
 }
 
 void PluginStream::startStream()
@@ -268,15 +277,19 @@ void PluginStream::delayDeliveryTimerFired()
 
 void PluginStream::deliverData()
 {
-    if (m_streamState == StreamStopped || !m_stream.ndata || m_deliveryData.empty())
+    if (m_isDeliveringData || m_streamState == StreamStopped || !m_stream.ndata || m_deliveryData.empty())
         return;
 
-    int32_t totalBytes = static_cast<int32_t>(m_deliveryData.size());
-    int32_t totalBytesDelivered = 0;
-
+    scoped_refptr<PluginStream> protect(this);
+    m_isDeliveringData = true;
     setDefersLoading(true);
-    while (totalBytesDelivered < totalBytes) {
+
+    while (m_streamState != StreamStopped && m_stream.ndata && !m_deliveryData.empty()) {
+        int32_t totalBytes = static_cast<int32_t>(m_deliveryData.size());
         int32_t deliveryBytes = m_pluginFuncs->writeready ? m_pluginFuncs->writeready(m_instance, &m_stream) : totalBytes;
+        if (m_streamState == StreamStopped || !m_stream.ndata)
+            break;
+
         if (deliveryBytes <= 0) {
             if (!m_delayDeliveryTimer.IsRunning()) {
                 m_delayDeliveryTimer.Start(FROM_HERE, base::TimeDelta(),
@@ -285,33 +298,41 @@ void PluginStream::deliverData()
             break;
         }
 
-        deliveryBytes = std::min(deliveryBytes, totalBytes - totalBytesDelivered);
-        int32_t dataLength = deliveryBytes;
-        char* dataPtr = m_deliveryData.data() + totalBytesDelivered;
+        int32_t dataLength = std::min(deliveryBytes, static_cast<int32_t>(m_deliveryData.size()));
+        std::vector<char> chunk(m_deliveryData.begin(), m_deliveryData.begin() + dataLength);
 
-        deliveryBytes = m_pluginFuncs->write(m_instance, &m_stream, m_offset, dataLength, dataPtr);
-        if (deliveryBytes < 0) {
+        int32_t written = m_pluginFuncs->write(m_instance, &m_stream, m_offset, dataLength, chunk.data());
+        if (m_streamState == StreamStopped || !m_stream.ndata)
+            break;
+
+        if (written < 0) {
             setDefersLoading(false);
+            m_isDeliveringData = false;
             cancelAndDestroyStream(NPRES_NETWORK_ERR);
             return;
         }
-        deliveryBytes = std::min(deliveryBytes, dataLength);
-        m_offset += deliveryBytes;
-        totalBytesDelivered += deliveryBytes;
-    }
-    setDefersLoading(false);
+        if (written == 0) {
+            if (!m_delayDeliveryTimer.IsRunning()) {
+                m_delayDeliveryTimer.Start(FROM_HERE, base::TimeDelta(),
+                    base::BindOnce(&PluginStream::delayDeliveryTimerFired, base::Unretained(this)));
+            }
+            break;
+        }
 
-    if (totalBytesDelivered > 0) {
-        if (totalBytesDelivered < totalBytes) {
-            int remaining = totalBytes - totalBytesDelivered;
-            memmove(m_deliveryData.data(), m_deliveryData.data() + totalBytesDelivered, remaining);
-            m_deliveryData.resize(remaining);
-        } else {
+        written = std::min(written, dataLength);
+        m_offset += written;
+        if (static_cast<size_t>(written) >= m_deliveryData.size()) {
             m_deliveryData.clear();
-            if (m_reason != kWebReasonNone)
-                destroyStreamImpl();
+        } else {
+            m_deliveryData.erase(m_deliveryData.begin(), m_deliveryData.begin() + written);
         }
     }
+
+    setDefersLoading(false);
+    m_isDeliveringData = false;
+
+    if (m_streamState != StreamStopped && m_deliveryData.empty() && m_reason != kWebReasonNone)
+        destroyStreamImpl();
 }
 
 void PluginStream::sendJavaScriptStream(const blink::KURL& requestURL, const std::string& resultString)
@@ -363,6 +384,8 @@ void PluginStream::didReceiveDataManual(base::span<const char> data)
 
 void PluginStream::didFinishLoadingManual()
 {
+    if (m_streamState == StreamStopped || m_reason != kWebReasonNone)
+        return;
     scoped_refptr<PluginStream> protect(this);
     destroyStream(NPRES_DONE);
     if (m_bodyWatcher) {
@@ -434,11 +457,15 @@ void PluginStream::drainBodyPipe()
         MojoResult rv = m_bodyPipe->BeginReadData(MOJO_READ_DATA_FLAG_NONE, buffer);
         if (rv == MOJO_RESULT_OK) {
             size_t numBytes = buffer.size();
+            std::vector<char> copy;
             if (numBytes > 0) {
-                didReceiveDataManual(base::span<const char>(reinterpret_cast<const char*>(buffer.data()), numBytes));
+                copy.resize(numBytes);
+                memcpy(copy.data(), buffer.data(), numBytes);
             }
-            if (m_bodyPipe.is_valid())
-                m_bodyPipe->EndReadData(numBytes);
+            m_bodyPipe->EndReadData(numBytes);
+            if (!copy.empty()) {
+                didReceiveDataManual(base::span<const char>(copy.data(), copy.size()));
+            }
         } else if (rv == MOJO_RESULT_FAILED_PRECONDITION) {
             if (m_bodyWatcher) {
                 m_bodyWatcher->Cancel();

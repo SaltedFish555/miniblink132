@@ -1037,6 +1037,7 @@ void WebLocalFrameClientImpl::onLoadingSucceeded()
 
 void WebLocalFrameClientImpl::DidFinishLoad()
 {
+    WebPluginImpl::notifyManualLoadFinishedForFrame(m_frame);
     OutputDebugStringA(m_isMainFrame ? "WebLocalFrameClientImpl::DidFinishLoad main\n" : "WebLocalFrameClientImpl::DidFinishLoad not main\n");
 }
 

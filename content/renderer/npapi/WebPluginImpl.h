@@ -130,10 +130,32 @@ public:
 
     static WebPluginImpl* currentPluginView();
     static bool isAlive(NPP instance);
+    static void notifyManualLoadFinishedForFrame(blink::WebLocalFrame* frame);
 
 private:
+    class ScopedCurrentPluginView {
+    public:
+        explicit ScopedCurrentPluginView(WebPluginImpl* view)
+            : m_previous(s_currentPluginView)
+        {
+            s_currentPluginView = view;
+        }
+        ~ScopedCurrentPluginView()
+        {
+            s_currentPluginView = m_previous;
+        }
+        ScopedCurrentPluginView(const ScopedCurrentPluginView&) = delete;
+        ScopedCurrentPluginView& operator=(const ScopedCurrentPluginView&) = delete;
+
+    private:
+        WebPluginImpl* m_previous;
+    };
+
     friend class base::RefCounted<WebPluginImpl>;
     ~WebPluginImpl() override;
+
+    void registerManualPlugin();
+    void unregisterManualPlugin();
 
     void init();
     bool start();
@@ -206,6 +228,7 @@ private:
     NPObject* m_pluginElementNPObject = nullptr;
 
     bool m_haveInitialized = false;
+    bool m_hasLoadedPlugin = false;
     bool m_isStarted = false;
     bool m_isWindowed = true;
     bool m_isTransparent = false;
