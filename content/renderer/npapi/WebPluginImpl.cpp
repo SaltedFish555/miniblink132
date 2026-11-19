@@ -22,6 +22,7 @@
 #include "content/renderer/npapi/npruntime_priv.h"
 #include "mbnet/cookies/WebCookieJarCurlImpl.h"
 #include "services/network/public/cpp/resource_request_body.h"
+#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
 #include "third_party/blink/public/platform/platform.h"
 #include "third_party/blink/public/platform/web_security_origin.h"
 #include "third_party/blink/public/platform/web_url_request.h"
@@ -409,6 +410,7 @@ bool WebPluginImpl::start()
         auto req = std::make_unique<network::ResourceRequest>();
         req->method = "GET";
         req->url = GURL(m_url.GetString().Utf8());
+        req->resource_type = static_cast<int>(blink::mojom::ResourceType::kObject);
         req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
         blink::KURL docUrl = m_webFrame->GetDocument().Url();
         if (docUrl.ProtocolIsInHTTPFamily())

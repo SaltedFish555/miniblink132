@@ -16,6 +16,7 @@
 #include "net/http/http_request_headers.h"
 #include "services/network/public/cpp/data_element.h"
 #include "services/network/public/cpp/resource_request_body.h"
+#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
 #include "third_party/blink/public/platform/platform.h"
 #include "third_party/blink/public/platform/web_data.h"
 #include "third_party/blink/public/platform/web_http_body.h"
@@ -355,6 +356,7 @@ NPError WebPluginImpl::getURLNotify(const char* url, const char* target, void* n
     auto req = std::make_unique<network::ResourceRequest>();
     req->method = "GET";
     req->url = GURL(resolved.GetString().Utf8());
+    req->resource_type = static_cast<int>(blink::mojom::ResourceType::kPluginResource);
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
     setPluginRequestReferer(m_webFrame, req.get());
     return loadRequest(std::move(req), target, true, notifyData);
@@ -368,6 +370,7 @@ NPError WebPluginImpl::getURL(const char* url, const char* target)
     auto req = std::make_unique<network::ResourceRequest>();
     req->method = "GET";
     req->url = GURL(resolved.GetString().Utf8());
+    req->resource_type = static_cast<int>(blink::mojom::ResourceType::kPluginResource);
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
     setPluginRequestReferer(m_webFrame, req.get());
     return loadRequest(std::move(req), target, false, nullptr);
@@ -430,6 +433,7 @@ NPError WebPluginImpl::handlePost(
     req->method = "POST";
     blink::KURL resolved = makePluginURL(m_webFrame->GetDocument().BaseURL(), url);
     req->url = GURL(resolved.GetString().Utf8());
+    req->resource_type = static_cast<int>(blink::mojom::ResourceType::kPluginResource);
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
     setPluginRequestReferer(m_webFrame, req.get());
 
@@ -486,6 +490,7 @@ void WebPluginImpl::DidReceiveResponse(const blink::WebURLResponse& response)
     auto req = std::make_unique<network::ResourceRequest>();
     req->method = "GET";
     req->url = GURL(response.CurrentRequestUrl().GetString().Utf8());
+    req->resource_type = static_cast<int>(blink::mojom::ResourceType::kObject);
     m_manualStream = PluginStream::create(
         this, m_mbwebviewId, std::move(req), nullptr, false, nullptr, m_plugin, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
     m_manualStream->setLoadManually(true);

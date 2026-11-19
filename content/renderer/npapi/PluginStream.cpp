@@ -14,6 +14,7 @@
 #include "base/task/single_thread_task_runner.h"
 #include "content/renderer/npapi/WebPluginImpl.h"
 #include "mbnet/WebURLLoaderImplCurl.h"
+#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
 #include "third_party/blink/public/platform/web_http_header_visitor.h"
 
 namespace content {
@@ -134,6 +135,13 @@ void PluginStream::start()
 {
     if (m_loadManually || !m_request)
         return;
+
+    // Never let plugin stream fetches default to ResourceType::kMainFrame (0),
+    // otherwise mbnet treats binary game assets (e.g. .data/.bin) as frame downloads.
+    if (m_request->resource_type == static_cast<int>(blink::mojom::ResourceType::kMainFrame)
+        || m_request->resource_type == static_cast<int>(blink::mojom::ResourceType::kSubFrame)) {
+        m_request->resource_type = static_cast<int>(blink::mojom::ResourceType::kPluginResource);
+    }
 
     scoped_refptr<base::SingleThreadTaskRunner> runner = base::SingleThreadTaskRunner::GetCurrentDefault();
     m_loader = std::make_unique<mbnet::WebURLLoaderImplCurl>(runner, runner, nullptr, m_mbwebviewId);
