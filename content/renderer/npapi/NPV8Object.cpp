@@ -28,16 +28,21 @@ namespace content {
 
 namespace {
 
+std::unordered_map<int, std::vector<V8NPObject*>>& v8NPObjectHashMap()
+{
+    static auto* s_map = new std::unordered_map<int, std::vector<V8NPObject*>>();
+    return *s_map;
+}
+
 NPObject* allocV8NPObject(NPP, NPClass*)
 {
-    return static_cast<NPObject*>(malloc(sizeof(V8NPObject)));
+    return static_cast<NPObject*>(calloc(1, sizeof(V8NPObject)));
 }
 
 void freeV8NPObject(NPObject* npObject)
 {
+    disposeV8NPObject(npObject);
     auto* v8NpObject = reinterpret_cast<V8NPObject*>(npObject);
-    v8NpObject->v8Object.Reset();
-    v8NpObject->v8Context.Reset();
     v8NpObject->~V8NPObject();
     free(v8NpObject);
 }
@@ -234,6 +239,32 @@ V8NPObject* npObjectToV8NPObject(NPObject* npObject)
     return v8NpObject->v8Object.IsEmpty() ? nullptr : v8NpObject;
 }
 
+void disposeV8NPObject(NPObject* npObject)
+{
+    if (!npObject || npObject->_class != &g_v8NPObjectClass)
+        return;
+    auto* v8NpObject = reinterpret_cast<V8NPObject*>(npObject);
+    if (v8NpObject->identityHash != 0) {
+        auto& hashMap = v8NPObjectHashMap();
+        auto it = hashMap.find(v8NpObject->identityHash);
+        if (it != hashMap.end()) {
+            auto& bucket = it->second;
+            for (auto vit = bucket.begin(); vit != bucket.end(); ++vit) {
+                if (*vit == v8NpObject) {
+                    bucket.erase(vit);
+                    break;
+                }
+            }
+            if (bucket.empty())
+                hashMap.erase(it);
+        }
+        v8NpObject->identityHash = 0;
+    }
+    v8NpObject->v8Object.Reset();
+    v8NpObject->v8Context.Reset();
+    v8NpObject->rootFrame = nullptr;
+}
+
 NPObject* npCreateV8ScriptObject(
     v8::Isolate* isolate, v8::Local<v8::Context> context, NPP npp, v8::Local<v8::Object> object, blink::WebLocalFrame* rootFrame, int64_t mbwebviewId)
 {
@@ -247,6 +278,22 @@ NPObject* npCreateV8ScriptObject(
         return unwrapped;
     }
 
+    int hash = object->GetIdentityHash();
+    auto& hashMap = v8NPObjectHashMap();
+    if (hash != 0) {
+        auto it = hashMap.find(hash);
+        if (it != hashMap.end()) {
+            for (V8NPObject* existing : it->second) {
+                if (existing && !existing->v8Object.IsEmpty()
+                    && existing->rootFrame == rootFrame
+                    && existing->v8Object.Get(isolate) == object) {
+                    _NPN_RetainObject(&existing->object);
+                    return reinterpret_cast<NPObject*>(existing);
+                }
+            }
+        }
+    }
+
     auto* v8npObject = reinterpret_cast<V8NPObject*>(_NPN_CreateObject(npp, &g_v8NPObjectClass));
     if (!v8npObject)
         return nullptr;
@@ -258,6 +305,9 @@ NPObject* npCreateV8ScriptObject(
         v8npObject->v8Context.Reset(isolate, context);
     v8npObject->rootFrame = rootFrame;
     v8npObject->mbwebviewId = mbwebviewId;
+    v8npObject->identityHash = hash;
+    if (hash != 0)
+        hashMap[hash].push_back(v8npObject);
     return reinterpret_cast<NPObject*>(v8npObject);
 }
 
@@ -542,10 +592,18 @@ bool _NPN_HasMethod(NPP, NPObject* npObject, NPIdentifier methodName)
 
 void _NPN_SetException(NPObject*, const NPUTF8* message)
 {
+    const char* msg = message ? message : "NPObject exception";
     if (message) {
         OutputDebugStringA("_NPN_SetException: ");
         OutputDebugStringA(message);
         OutputDebugStringA("\n");
+    }
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    if (isolate && isolate->InContext()) {
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::String> str;
+        if (v8::String::NewFromUtf8(isolate, msg).ToLocal(&str))
+            isolate->ThrowException(v8::Exception::Error(str));
     }
 }
 

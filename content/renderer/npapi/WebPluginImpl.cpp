@@ -535,11 +535,18 @@ v8::Local<v8::Object> WebPluginImpl::V8ScriptableObject(v8::Isolate* isolate)
     if (!scriptObj)
         return v8::Local<v8::Object>();
 
+    v8::EscapableHandleScope handleScope(isolate);
     v8::Local<v8::Context> context = m_webFrame->MainWorldScriptContext();
-    v8::Local<v8::Object> wrapped = createV8ObjectForNPObject(isolate, context, scriptObj, nullptr);
+    if (context.IsEmpty()) {
+        _NPN_ReleaseObject(scriptObj);
+        return v8::Local<v8::Object>();
+    }
+
+    v8::Context::Scope contextScope(context);
+    v8::Local<v8::Object> wrapped = createV8ObjectForNPObject(isolate, context, scriptObj, windowScriptNPObject());
     // NPPVpluginScriptableNPObject returns a retained reference; createV8ObjectForNPObject also retains it.
     _NPN_ReleaseObject(scriptObj);
-    return wrapped;
+    return handleScope.Escape(wrapped);
 }
 
 const char* WebPluginImpl::userAgent()
