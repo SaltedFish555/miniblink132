@@ -939,7 +939,11 @@ static bool setHttpResponseDataToJobWhenDidReceiveResponseOnMainThread(WebURLLoa
     if (!contentType.IsEmpty())
         job->m_response.SetMimeType(blink::ExtractMIMETypeFromMediaType(contentType).LowerASCII());
 
-    if (content::isNpapiPluginsEnabled() && job->firstRequest() && isSwfOrSplUrl(job->firstRequest()->url)
+    GURL effectiveUrl = job->firstRequest() ? job->firstRequest()->url : GURL();
+    if (!job->m_response.CurrentRequestUrl().IsEmpty())
+        effectiveUrl = GURL(job->m_response.CurrentRequestUrl().GetString().Utf8());
+
+    if (content::isNpapiPluginsEnabled() && effectiveUrl.is_valid() && isSwfOrSplUrl(effectiveUrl)
         && !IsContentDispositionAttachment(job->m_response.HttpHeaderField("Content-Disposition"))
         && content::PluginDatabase::installedPlugins()->isMIMETypeRegistered("application/x-shockwave-flash")) {
         String curMime = String(job->m_response.MimeType()).LowerASCII();

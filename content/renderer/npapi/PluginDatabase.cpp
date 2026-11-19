@@ -4,11 +4,13 @@
 #include "content/renderer/npapi/PluginDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/synchronization/lock.h"
 
 #if defined(_WIN32)
 #include <shlwapi.h>
@@ -18,9 +20,30 @@ namespace content {
 
 namespace {
 
-bool g_npapiPluginsEnabled = true;
+std::atomic<bool> g_npapiPluginsEnabled { true };
 mbGetPluginListCallback g_pluginListCallback = nullptr;
 void* g_pluginListCallbackParam = nullptr;
+
+base::Lock& npapiGlobalsLock()
+{
+    static auto* s_lock = new base::Lock();
+    return *s_lock;
+}
+
+std::vector<std::string>& extraPreferredDirectories()
+{
+    static auto* s_dirs = new std::vector<std::string>();
+    return *s_dirs;
+}
+
+std::string normalizeDirForCompare(const std::string& dirUtf8)
+{
+    std::string normalized = dirUtf8;
+    std::replace(normalized.begin(), normalized.end(), '/', '\\');
+    while (normalized.size() > 3 && normalized.back() == '\\')
+        normalized.pop_back();
+    return base::ToLowerASCII(normalized);
+}
 
 #if defined(_WIN32)
 WTF::String moduleBaseDirectory(HMODULE mod)
@@ -65,17 +88,20 @@ void pushUniqueDirectory(std::vector<WTF::String>& directories, const WTF::Strin
     directories.push_back(dir);
 }
 
-void addPluginPathsFromRegistry(HKEY rootKey, std::set<std::string>& paths)
+void addPluginPathsFromRegistry(HKEY rootKey, std::map<std::string, std::string>& pathsByLowerKey)
 {
     HKEY key = nullptr;
     if (::RegOpenKeyExW(rootKey, L"Software\\MozillaPlugins", 0, KEY_ENUMERATE_SUB_KEYS, &key) != ERROR_SUCCESS)
         return;
 
-    wchar_t name[128];
+    wchar_t name[512];
     FILETIME lastModified;
     for (DWORD i = 0;; ++i) {
-        DWORD nameLen = 128;
-        if (::RegEnumKeyExW(key, i, name, &nameLen, nullptr, nullptr, nullptr, &lastModified) != ERROR_SUCCESS)
+        DWORD nameLen = static_cast<DWORD>(std::size(name));
+        LONG enumRes = ::RegEnumKeyExW(key, i, name, &nameLen, nullptr, nullptr, nullptr, &lastModified);
+        if (enumRes == ERROR_MORE_DATA)
+            continue;
+        if (enumRes != ERROR_SUCCESS)
             break;
 
         WCHAR pathBuf[MAX_PATH] = { 0 };
@@ -83,7 +109,8 @@ void addPluginPathsFromRegistry(HKEY rootKey, std::set<std::string>& paths)
         DWORD type = 0;
         if (::SHGetValueW(key, name, L"Path", &type, pathBuf, &pathBytes) == ERROR_SUCCESS
             && type == REG_SZ && pathBytes > sizeof(WCHAR)) {
-            paths.insert(base::WideToUTF8(pathBuf));
+            std::string utf8Path = base::WideToUTF8(pathBuf);
+            pathsByLowerKey.emplace(normalizeDirForCompare(utf8Path), std::move(utf8Path));
         }
     }
     ::RegCloseKey(key);
@@ -120,28 +147,40 @@ bool getPathModifiedTime(const std::string& utf8Path, time_t* outModified)
 
 bool isNpapiPluginsEnabled()
 {
-    return g_npapiPluginsEnabled;
+    return g_npapiPluginsEnabled.load(std::memory_order_acquire);
 }
 
 void setNpapiPluginsEnabled(bool enabled)
 {
-    g_npapiPluginsEnabled = enabled;
+    g_npapiPluginsEnabled.store(enabled, std::memory_order_release);
 }
 
 void setNpapiPluginListCallback(mbGetPluginListCallback callback, void* param)
 {
+    base::AutoLock lock(npapiGlobalsLock());
     g_pluginListCallback = callback;
     g_pluginListCallbackParam = param;
 }
 
 mbGetPluginListCallback getNpapiPluginListCallback()
 {
+    base::AutoLock lock(npapiGlobalsLock());
     return g_pluginListCallback;
 }
 
 void* getNpapiPluginListCallbackParam()
 {
+    base::AutoLock lock(npapiGlobalsLock());
     return g_pluginListCallbackParam;
+}
+
+void getNpapiPluginListCallbackWithParam(mbGetPluginListCallback* outCallback, void** outParam)
+{
+    base::AutoLock lock(npapiGlobalsLock());
+    if (outCallback)
+        *outCallback = g_pluginListCallback;
+    if (outParam)
+        *outParam = g_pluginListCallbackParam;
 }
 
 PluginDatabase* PluginDatabase::installedPlugins(bool populate)
@@ -171,8 +210,24 @@ void PluginDatabase::addExtraPluginDirectory(const WTF::String& directory)
 {
     if (directory.empty())
         return;
+
+    std::string dirUtf8 = directory.Utf8();
+    std::string normDir = normalizeDirForCompare(dirUtf8);
+    {
+        base::AutoLock lock(npapiGlobalsLock());
+        auto& extraDirs = extraPreferredDirectories();
+        auto addNorm = [&extraDirs](const std::string& d) {
+            if (!d.empty() && std::find(extraDirs.begin(), extraDirs.end(), d) == extraDirs.end())
+                extraDirs.push_back(d);
+        };
+        addNorm(normDir);
+        size_t slashPos = normDir.find_last_of('\\');
+        if (slashPos != std::string::npos && base::EndsWith(normDir, ".dll", base::CompareCase::SENSITIVE))
+            addNorm(normDir.substr(0, slashPos));
+    }
+
     for (const auto& existing : m_pluginDirectories) {
-        if (existing == directory) {
+        if (normalizeDirForCompare(existing.Utf8()) == normDir) {
             refresh();
             return;
         }
@@ -193,26 +248,32 @@ bool PluginDatabase::refresh()
         pluginSetChanged = !pluginsToUnload.empty();
     }
 
-    std::set<std::string> paths;
-    getPluginPathsInDirectories(paths);
+    std::map<std::string, std::string> pathsByLowerKey;
+    getPluginPathsInDirectories(pathsByLowerKey);
 
     std::map<std::string, time_t> pathsWithTimes;
     bool shouldSkipUnchangedFiles = !pluginSetChanged;
 
-    for (const std::string& path : paths) {
+    for (const auto& entry : pathsByLowerKey) {
+        const std::string& pathKey = entry.first;
+        const std::string& path = entry.second;
+
         time_t lastModified = 0;
         if (!getPathModifiedTime(path, &lastModified))
             continue;
 
-        pathsWithTimes[path] = lastModified;
+        pathsWithTimes[pathKey] = lastModified;
 
-        auto timeIt = m_pluginPathsWithTimes.find(path);
+        auto timeIt = m_pluginPathsWithTimes.find(pathKey);
         if (shouldSkipUnchangedFiles && timeIt != m_pluginPathsWithTimes.end() && timeIt->second == lastModified)
             continue;
 
-        auto oldIt = m_pluginsByPath.find(base::ToLowerASCII(path));
-        if (oldIt != m_pluginsByPath.end())
+        auto oldIt = m_pluginsByPath.find(pathKey);
+        if (oldIt != m_pluginsByPath.end()) {
+            if (oldIt->second->lastModified() == lastModified)
+                continue;
             remove(oldIt->second.get());
+        }
 
         scoped_refptr<PluginPackage> package = PluginPackage::createPackage(WTF::String::FromUTF8(path), lastModified);
         if (package && add(std::move(package)))
@@ -377,7 +438,7 @@ bool PluginDatabase::add(scoped_refptr<PluginPackage> package)
 
     // Deduplicate by canonical path so preferred app-directory plugins are not discarded
     // when a system directory plugin with the same normalized name/description sorts earlier.
-    std::string pathKey = base::ToLowerASCII(package->path().Utf8());
+    std::string pathKey = normalizeDirForCompare(package->path().Utf8());
     if (m_pluginsByPath.find(pathKey) != m_pluginsByPath.end())
         return false;
     m_pluginsByPath[pathKey] = package;
@@ -393,7 +454,7 @@ void PluginDatabase::remove(PluginPackage* package)
             m_preferredPlugins.erase(it);
     }
     if (!package->isVirtual())
-        m_pluginsByPath.erase(base::ToLowerASCII(package->path().Utf8()));
+        m_pluginsByPath.erase(normalizeDirForCompare(package->path().Utf8()));
     m_plugins.erase(std::remove_if(m_plugins.begin(), m_plugins.end(),
                         [package](const scoped_refptr<PluginPackage>& p) { return p.get() == package; }),
         m_plugins.end());
@@ -408,7 +469,7 @@ void PluginDatabase::clear()
     m_preferredPlugins.clear();
 }
 
-void PluginDatabase::getPluginPathsInDirectories(std::set<std::string>& paths) const
+void PluginDatabase::getPluginPathsInDirectories(std::map<std::string, std::string>& pathsByLowerKey) const
 {
 #if defined(_WIN32)
     for (const WTF::String& dirStr : m_pluginDirectories) {
@@ -419,7 +480,8 @@ void PluginDatabase::getPluginPathsInDirectories(std::set<std::string>& paths) c
         // Also allow passing a direct DLL file path in mbAddPluginDirectory.
         DWORD attr = ::GetFileAttributesW(wideDir.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            paths.insert(base::WideToUTF8(wideDir));
+            std::string utf8Path = base::WideToUTF8(wideDir);
+            pathsByLowerKey.emplace(normalizeDirForCompare(utf8Path), std::move(utf8Path));
             continue;
         }
 
@@ -447,14 +509,15 @@ void PluginDatabase::getPluginPathsInDirectories(std::set<std::string>& paths) c
                 continue;
 
             std::wstring fullPath = wideDir + L"\\" + findData.cFileName;
-            paths.insert(base::WideToUTF8(fullPath));
+            std::string utf8FullPath = base::WideToUTF8(fullPath);
+            pathsByLowerKey.emplace(normalizeDirForCompare(utf8FullPath), std::move(utf8FullPath));
         } while (::FindNextFileW(hFind, &findData) != 0);
 
         ::FindClose(hFind);
     }
 
-    addPluginPathsFromRegistry(HKEY_LOCAL_MACHINE, paths);
-    addPluginPathsFromRegistry(HKEY_CURRENT_USER, paths);
+    addPluginPathsFromRegistry(HKEY_LOCAL_MACHINE, pathsByLowerKey);
+    addPluginPathsFromRegistry(HKEY_CURRENT_USER, pathsByLowerKey);
 #endif
 }
 
@@ -482,20 +545,24 @@ bool PluginDatabase::isPreferredPluginDirectory(const WTF::String& directory)
 #if defined(_WIN32)
     if (directory.empty())
         return false;
-    std::string dirUtf8 = directory.Utf8();
+    std::string normDir = normalizeDirForCompare(directory.Utf8());
+    {
+        base::AutoLock lock(npapiGlobalsLock());
+        const auto& extraDirs = extraPreferredDirectories();
+        if (std::find(extraDirs.begin(), extraDirs.end(), normDir) != extraDirs.end())
+            return true;
+    }
     WTF::String exeDir = moduleBaseDirectory(nullptr);
     if (!exeDir.empty()) {
-        std::string exeUtf8 = exeDir.Utf8();
-        if (base::EqualsCaseInsensitiveASCII(dirUtf8, exeUtf8)
-            || base::EqualsCaseInsensitiveASCII(dirUtf8, exeUtf8 + "\\plugins")) {
+        std::string normExe = normalizeDirForCompare(exeDir.Utf8());
+        if (normDir == normExe || normDir == normExe + "\\plugins") {
             return true;
         }
     }
     WTF::String dllDir = currentDllDirectory();
     if (!dllDir.empty()) {
-        std::string dllUtf8 = dllDir.Utf8();
-        if (base::EqualsCaseInsensitiveASCII(dirUtf8, dllUtf8)
-            || base::EqualsCaseInsensitiveASCII(dirUtf8, dllUtf8 + "\\plugins")) {
+        std::string normDll = normalizeDirForCompare(dllDir.Utf8());
+        if (normDir == normDll || normDir == normDll + "\\plugins") {
             return true;
         }
     }

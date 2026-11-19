@@ -47,7 +47,7 @@ public:
     bool addVirtualPlugin(scoped_refptr<PluginPackage> package) { return add(std::move(package)); }
 
 private:
-    void getPluginPathsInDirectories(std::set<std::string>& paths) const;
+    void getPluginPathsInDirectories(std::map<std::string, std::string>& pathsByLowerKey) const;
     void getDeletedPlugins(std::vector<PluginPackage*>& plugins) const;
     bool fileExistsAndIsNotDisabled(const std::string& filePath) const;
 

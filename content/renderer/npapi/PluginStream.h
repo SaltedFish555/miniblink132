@@ -13,6 +13,7 @@
 #include "base/memory/ref_counted.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/timer/timer.h"
+#include "content/renderer/npapi/PluginPackage.h"
 #include "content/renderer/npapi/PluginQuirkSet.h"
 #include "mojo/public/cpp/system/data_pipe.h"
 #include "mojo/public/cpp/system/simple_watcher.h"
@@ -50,7 +51,8 @@ class PluginStream : public base::RefCounted<PluginStream>,
 public:
     static scoped_refptr<PluginStream> create(PluginStreamClient* client, int64_t mbwebviewId,
         std::unique_ptr<network::ResourceRequest> request, scoped_refptr<const blink::SecurityOrigin> topFrameOrigin,
-        bool sendNotification, void* notifyData, const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks);
+        bool sendNotification, void* notifyData, scoped_refptr<PluginPackage> pluginPackage,
+        const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks);
 
     void start();
     void stop();
@@ -82,7 +84,7 @@ private:
     friend class base::RefCounted<PluginStream>;
     PluginStream(PluginStreamClient* client, int64_t mbwebviewId, std::unique_ptr<network::ResourceRequest> request,
         scoped_refptr<const blink::SecurityOrigin> topFrameOrigin, bool sendNotification, void* notifyData,
-        const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks);
+        scoped_refptr<PluginPackage> pluginPackage, const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks);
     ~PluginStream() override;
 
     void startStream();
@@ -118,6 +120,7 @@ private:
     base::FilePath m_tempFilePath;
     base::File m_tempFile;
 
+    scoped_refptr<PluginPackage> m_pluginPackage;
     const NPPluginFuncs* m_pluginFuncs = nullptr;
     NPP m_instance = nullptr;
     uint16_t m_transferMode = NP_NORMAL;

@@ -46,7 +46,7 @@ jobs:
           - group: v8_a
             projects: "v8/v8_2.vcxproj"
           - group: v8_b
-            projects: "v8/v8_3.vcxproj.vcxproj,v8/v8_gin.vcxproj,V8_GEN"
+            projects: "v8/v8_3.vcxproj,v8/v8_gin.vcxproj,V8_GEN"
           - group: chromium
             projects: "chromium/chromium.vcxproj"
           - group: gen_1

@@ -66,6 +66,58 @@ blink::KURL makePluginURL(const blink::KURL& baseURL, const char* relativeURLStr
     return blink::KURL(baseURL, WTF::String::FromUTF8(raw));
 }
 
+bool isHttpHeaderTokenChar(unsigned char c)
+{
+    if (c <= 0x20 || c >= 0x7F)
+        return false;
+    switch (c) {
+    case '(': case ')': case '<': case '>': case '@':
+    case ',': case ';': case ':': case '\\': case '"':
+    case '/': case '[': case ']': case '?': case '=':
+    case '{': case '}':
+        return false;
+    default:
+        return true;
+    }
+}
+
+bool isValidPostHeaderBlock(std::string_view sv, size_t headerEnd)
+{
+    if (headerEnd == 0 || headerEnd > sv.size())
+        return false;
+
+    size_t pos = 0;
+    size_t headerLineCount = 0;
+    while (pos < headerEnd) {
+        size_t eol = sv.find_first_of("\r\n", pos);
+        size_t lineEnd = (eol == std::string_view::npos || eol > headerEnd) ? headerEnd : eol;
+        std::string_view line = sv.substr(pos, lineEnd - pos);
+        pos = lineEnd;
+        if (pos < headerEnd && sv[pos] == '\r')
+            ++pos;
+        if (pos < headerEnd && sv[pos] == '\n')
+            ++pos;
+
+        if (line.empty())
+            break;
+
+        size_t colon = line.find(':');
+        if (colon == std::string_view::npos || colon == 0)
+            return false;
+        for (size_t i = 0; i < colon; ++i) {
+            if (!isHttpHeaderTokenChar(static_cast<unsigned char>(line[i])))
+                return false;
+        }
+        for (size_t i = colon + 1; i < line.size(); ++i) {
+            unsigned char ch = static_cast<unsigned char>(line[i]);
+            if (ch == 0 || (ch < 0x20 && ch != '\t') || ch == 0x7F)
+                return false;
+        }
+        ++headerLineCount;
+    }
+    return headerLineCount > 0;
+}
+
 int locationAfterFirstBlankLine(const std::vector<char>& buffer)
 {
     std::string_view sv(buffer.data(), buffer.size());
@@ -80,15 +132,71 @@ int locationAfterFirstBlankLine(const std::vector<char>& buffer)
     size_t posLF = sv.find("\n\n");
     size_t posCRLF_LF = sv.find("\r\n\n");
 
-    size_t bestEnd = std::string_view::npos;
-    if (posCRLF != std::string_view::npos)
-        bestEnd = std::min(bestEnd, posCRLF + 4);
-    if (posLF != std::string_view::npos)
-        bestEnd = std::min(bestEnd, posLF + 2);
-    if (posCRLF_LF != std::string_view::npos)
-        bestEnd = std::min(bestEnd, posCRLF_LF + 3);
+    size_t bestHeaderEnd = std::string_view::npos;
+    size_t bestBodyStart = std::string_view::npos;
+    auto consider = [&](size_t pos, size_t sepLen) {
+        if (pos != std::string_view::npos && pos < bestHeaderEnd) {
+            bestHeaderEnd = pos;
+            bestBodyStart = pos + sepLen;
+        }
+    };
+    consider(posCRLF, 4);
+    consider(posLF, 2);
+    consider(posCRLF_LF, 3);
 
-    return (bestEnd == std::string_view::npos) ? -1 : static_cast<int>(bestEnd);
+    if (bestBodyStart == std::string_view::npos)
+        return -1;
+    if (!isValidPostHeaderBlock(sv, bestHeaderEnd))
+        return -1;
+    return static_cast<int>(bestBodyStart);
+}
+
+void setPluginRequestReferer(blink::WebLocalFrame* webFrame, network::ResourceRequest* req)
+{
+    if (!webFrame || !req)
+        return;
+    blink::KURL docUrl = webFrame->GetDocument().Url();
+    if (docUrl.ProtocolIsInHTTPFamily())
+        req->headers.SetHeader("Referer", docUrl.GetString().Utf8());
+}
+
+bool isPathWithinTempDirectory(const base::FilePath& filePath)
+{
+    if (filePath.empty() || filePath.ReferencesParent())
+        return false;
+    base::FilePath tempDir;
+    if (!base::GetTempDir(&tempDir) || tempDir.empty())
+        return false;
+
+#if defined(_WIN32)
+    auto toNormalizedFullPath = [](const std::wstring& raw) -> std::wstring {
+        DWORD needed = ::GetFullPathNameW(raw.c_str(), 0, nullptr, nullptr);
+        if (needed == 0)
+            return std::wstring();
+        std::wstring buf(needed, L'\0');
+        DWORD len = ::GetFullPathNameW(raw.c_str(), needed, buf.data(), nullptr);
+        if (len == 0 || len >= needed)
+            return std::wstring();
+        buf.resize(len);
+        for (wchar_t& ch : buf) {
+            if (ch == L'/')
+                ch = L'\\';
+            else if (ch >= L'A' && ch <= L'Z')
+                ch = static_cast<wchar_t>(ch - L'A' + L'a');
+        }
+        return buf;
+    };
+
+    std::wstring normTemp = toNormalizedFullPath(tempDir.value());
+    std::wstring normFile = toNormalizedFullPath(filePath.value());
+    if (normTemp.empty() || normFile.empty())
+        return false;
+    if (normTemp.back() != L'\\')
+        normTemp.push_back(L'\\');
+    return normFile.size() > normTemp.size() && normFile.compare(0, normTemp.size(), normTemp) == 0;
+#else
+    return tempDir.IsParent(filePath);
+#endif
 }
 
 void parsePostHeaderFields(const char* bytes, size_t length, net::HttpRequestHeaders* outHeaders)
@@ -183,7 +291,7 @@ void WebPluginImpl::performRequest(std::unique_ptr<PluginRequest> req)
                 }
                 blink::KURL kurl(WTF::String::FromUTF8(urlSpec));
                 auto stream = PluginStream::create(this, m_mbwebviewId, std::move(req->request), nullptr,
-                    req->sendNotification, req->notifyData, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
+                    req->sendNotification, req->notifyData, m_plugin, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
                 m_streams.insert(stream);
                 stream->sendJavaScriptStream(kurl, jsStr);
             } else if (req->sendNotification && m_plugin->pluginFuncs()->urlnotify) {
@@ -201,10 +309,12 @@ void WebPluginImpl::performRequest(std::unique_ptr<PluginRequest> req)
         scoped_refptr<const blink::SecurityOrigin> origin = blink::SecurityOrigin::CreateFromString(
             m_webFrame->GetDocument().Url().GetString());
         auto stream = PluginStream::create(this, m_mbwebviewId, std::move(req->request), std::move(origin),
-            req->sendNotification, req->notifyData, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
+            req->sendNotification, req->notifyData, m_plugin, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
         m_streams.insert(stream);
         stream->start();
     } else if (m_pluginContainer) {
+        if (req->shouldAllowPopups && m_webFrame)
+            m_webFrame->NotifyUserActivation(blink::mojom::UserActivationNotificationType::kInteraction);
         blink::WebURLRequest webReq(blink::KURL(WTF::String::FromUTF8(urlSpec)));
         webReq.SetHttpMethod(blink::WebString::FromUTF8(req->request->method));
         net::HttpRequestHeaders::Iterator headerIt(req->request->headers);
@@ -246,7 +356,7 @@ NPError WebPluginImpl::getURLNotify(const char* url, const char* target, void* n
     req->method = "GET";
     req->url = GURL(resolved.GetString().Utf8());
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
-    req->headers.SetHeader("Referer", m_webFrame->GetDocument().BaseURL().GetString().Utf8());
+    setPluginRequestReferer(m_webFrame, req.get());
     return loadRequest(std::move(req), target, true, notifyData);
 }
 
@@ -259,7 +369,7 @@ NPError WebPluginImpl::getURL(const char* url, const char* target)
     req->method = "GET";
     req->url = GURL(resolved.GetString().Utf8());
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
-    req->headers.SetHeader("Referer", m_webFrame->GetDocument().BaseURL().GetString().Utf8());
+    setPluginRequestReferer(m_webFrame, req.get());
     return loadRequest(std::move(req), target, false, nullptr);
 }
 
@@ -275,6 +385,8 @@ NPError WebPluginImpl::postURL(const char* url, const char* target, uint32_t len
 
 NPError WebPluginImpl::handlePostReadFile(std::vector<char>& buffer, uint32_t len, const char* buf)
 {
+    if (!buf || len == 0)
+        return NPERR_INVALID_PARAM;
     std::string filename(buf, len);
     while (!filename.empty() && filename.back() == '\0')
         filename.pop_back();
@@ -284,6 +396,11 @@ NPError WebPluginImpl::handlePostReadFile(std::vector<char>& buffer, uint32_t le
     }
 
     base::FilePath path = base::FilePath::FromUTF8Unsafe(filename);
+    // Security: disallow arbitrary local file exfiltration via NPN_PostURL(file=TRUE);
+    // only allow temporary files under the OS temp directory.
+    if (!isPathWithinTempDirectory(path))
+        return NPERR_FILE_NOT_FOUND;
+
     std::string contents;
     if (!base::ReadFileToString(path, &contents))
         return NPERR_FILE_NOT_FOUND;
@@ -294,7 +411,7 @@ NPError WebPluginImpl::handlePostReadFile(std::vector<char>& buffer, uint32_t le
 NPError WebPluginImpl::handlePost(
     const char* url, const char* target, uint32_t len, const char* buf, bool file, void* notifyData, bool sendNotification, bool allowHeaders)
 {
-    if (!m_webFrame || !url || !len || !buf)
+    if (!m_webFrame || !url || (len > 0 && !buf))
         return NPERR_INVALID_PARAM;
 
     std::vector<char> buffer;
@@ -302,11 +419,11 @@ NPError WebPluginImpl::handlePost(
         NPError readErr = handlePostReadFile(buffer, len, buf);
         if (readErr != NPERR_NO_ERROR)
             return readErr;
-    } else {
+    } else if (len > 0) {
         buffer.assign(buf, buf + len);
     }
 
-    const char* postData = buffer.data();
+    const char* postData = buffer.empty() ? "" : buffer.data();
     size_t postDataLen = buffer.size();
 
     auto req = std::make_unique<network::ResourceRequest>();
@@ -314,20 +431,16 @@ NPError WebPluginImpl::handlePost(
     blink::KURL resolved = makePluginURL(m_webFrame->GetDocument().BaseURL(), url);
     req->url = GURL(resolved.GetString().Utf8());
     req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
-    req->headers.SetHeader("Referer", m_webFrame->GetDocument().BaseURL().GetString().Utf8());
+    setPluginRequestReferer(m_webFrame, req.get());
 
     if (allowHeaders && !buffer.empty()) {
-        if (buffer[0] == '\n') {
-            ++postData;
-            --postDataLen;
-        } else {
-            int loc = locationAfterFirstBlankLine(buffer);
-            if (loc != -1) {
+        int loc = locationAfterFirstBlankLine(buffer);
+        if (loc != -1) {
+            if (loc > 2)
                 parsePostHeaderFields(buffer.data(), static_cast<size_t>(loc), &req->headers);
-                req->headers.RemoveHeader("Content-Length");
-                postData += loc;
-                postDataLen = buffer.size() - static_cast<size_t>(loc);
-            }
+            req->headers.RemoveHeader("Content-Length");
+            postData = buffer.data() + loc;
+            postDataLen = buffer.size() - static_cast<size_t>(loc);
         }
     }
 
@@ -347,7 +460,7 @@ int32_t WebPluginImpl::write(NPStream*, int32_t, void*)
 
 NPError WebPluginImpl::destroyStream(NPStream* stream, NPReason reason)
 {
-    if (!stream || PluginStream::ownerForStream(stream) != m_instance)
+    if (!stream || !stream->ndata || PluginStream::ownerForStream(stream) != m_instance)
         return NPERR_INVALID_INSTANCE_ERROR;
     static_cast<PluginStream*>(stream->ndata)->cancelAndDestroyStream(reason);
     return NPERR_NO_ERROR;
@@ -374,7 +487,7 @@ void WebPluginImpl::DidReceiveResponse(const blink::WebURLResponse& response)
     req->method = "GET";
     req->url = GURL(response.CurrentRequestUrl().GetString().Utf8());
     m_manualStream = PluginStream::create(
-        this, m_mbwebviewId, std::move(req), nullptr, false, nullptr, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
+        this, m_mbwebviewId, std::move(req), nullptr, false, nullptr, m_plugin, m_plugin->pluginFuncs(), m_instance, m_plugin->quirks());
     m_manualStream->setLoadManually(true);
     m_manualStream->didReceiveResponseManual(response);
 }

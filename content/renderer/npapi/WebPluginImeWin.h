@@ -81,6 +81,7 @@ private:
     uint32_t m_resultClauses[2] = { 0, 0 };
     bool m_composingText = false;
     bool m_supportImeMessages = false;
+    bool m_hasPendingFallbackResult = false;
     bool m_statusUpdated = false;
     int m_inputType = 1;
     gfx::Rect m_caretRect;

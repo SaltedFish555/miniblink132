@@ -54,6 +54,7 @@ void setNpapiPluginsEnabled(bool enabled);
 void setNpapiPluginListCallback(mbGetPluginListCallback callback, void* param);
 mbGetPluginListCallback getNpapiPluginListCallback();
 void* getNpapiPluginListCallbackParam();
+void getNpapiPluginListCallbackWithParam(mbGetPluginListCallback* outCallback, void** outParam);
 
 } // namespace content
 

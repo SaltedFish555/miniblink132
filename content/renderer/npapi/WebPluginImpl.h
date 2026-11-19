@@ -128,11 +128,6 @@ public:
     static LRESULT CALLBACK PluginViewWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
-    static WebPluginImpl* currentPluginView();
-    static bool isAlive(NPP instance);
-    static void notifyManualLoadFinishedForFrame(blink::WebLocalFrame* frame);
-
-private:
     class ScopedCurrentPluginView {
     public:
         explicit ScopedCurrentPluginView(WebPluginImpl* view)
@@ -151,6 +146,12 @@ private:
         WebPluginImpl* m_previous;
     };
 
+    static WebPluginImpl* currentPluginView();
+    static WebPluginImpl* fromInstance(NPP instance);
+    static bool isAlive(NPP instance);
+    static void notifyManualLoadFinishedForFrame(blink::WebLocalFrame* frame);
+
+private:
     friend class base::RefCounted<WebPluginImpl>;
     ~WebPluginImpl() override;
 
@@ -203,8 +204,10 @@ private:
     static BOOL WINAPI hookedEndPaint(HWND hWnd, const PAINTSTRUCT* lpPaint);
 
     // Input helpers (implemented in WebPluginImplInputWin.cpp)
-    bool handleMouseEvent(const blink::WebInputEvent& rawEvent);
+    bool handleMouseEvent(const blink::WebInputEvent& rawEvent, ui::Cursor* cursor);
     bool handleKeyboardEvent(const blink::WebKeyboardEvent& evt);
+    void syncImeCaretPos();
+    void ensureInstanceAllocated();
 
     blink::WebPluginContainer* m_pluginContainer = nullptr;
     blink::WebLocalFrame* m_webFrame = nullptr;
@@ -228,6 +231,7 @@ private:
     NPObject* m_pluginElementNPObject = nullptr;
 
     bool m_haveInitialized = false;
+    bool m_isDestroyed = false;
     bool m_hasLoadedPlugin = false;
     bool m_isStarted = false;
     bool m_isWindowed = true;
@@ -259,6 +263,8 @@ private:
     HGDIOBJ m_oldBitmap = nullptr;
     void* m_memoryPixels = nullptr;
     SIZE m_memoryCanvasSize { 0, 0 };
+    HDC m_lastPaintHDC = nullptr;
+    gfx::Size m_lastSetWindowSize;
 
     std::unique_ptr<PluginMessageThrottlerWin> m_messageThrottler;
     WNDPROC m_pluginWndProc = nullptr;

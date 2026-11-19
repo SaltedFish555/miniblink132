@@ -6,7 +6,7 @@
 #include "content/renderer/npapi/PluginQuirkSet.h"
 #include "third_party/blink/public/mojom/plugins/plugin_registry.mojom-blink.h"
 
-bool blink::mojom::blink::PluginRegistry::GetPlugins(bool refresh, WTF::Vector<::blink::mojom::blink::PluginInfoPtr>* out_plugins)
+inline bool blink::mojom::blink::PluginRegistry::GetPlugins(bool refresh, WTF::Vector<::blink::mojom::blink::PluginInfoPtr>* out_plugins)
 {
     if (out_plugins)
         out_plugins->clear();
@@ -40,9 +40,11 @@ private:
         if (!isNpapiPluginsEnabled())
             return;
 
-        mbGetPluginListCallback customCb = getNpapiPluginListCallback();
+        mbGetPluginListCallback customCb = nullptr;
+        void* customParam = nullptr;
+        getNpapiPluginListCallbackWithParam(&customCb, &customParam);
         if (customCb) {
-            if (customCb(refresh ? TRUE : FALSE, out_plugins, getNpapiPluginListCallbackParam()))
+            if (customCb(refresh ? TRUE : FALSE, out_plugins, customParam))
                 return;
             out_plugins->clear();
         }

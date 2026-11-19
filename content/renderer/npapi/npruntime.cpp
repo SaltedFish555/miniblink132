@@ -10,7 +10,15 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "base/synchronization/lock.h"
+
 namespace {
+
+base::Lock& identifierMapLock()
+{
+    static auto* s_lock = new base::Lock();
+    return *s_lock;
+}
 
 std::unordered_map<std::string, content::PrivateIdentifier*>& stringIdentifierMap()
 {
@@ -49,6 +57,7 @@ NPIdentifier _NPN_GetStringIdentifier(const NPUTF8* name)
     if (!name)
         return nullptr;
 
+    base::AutoLock lock(identifierMapLock());
     std::string key(name);
     auto& identMap = stringIdentifierMap();
     auto it = identMap.find(key);
@@ -57,6 +66,8 @@ NPIdentifier _NPN_GetStringIdentifier(const NPUTF8* name)
 
     size_t nameLen = key.size();
     auto* identifier = static_cast<content::PrivateIdentifier*>(malloc(sizeof(content::PrivateIdentifier) + nameLen + 1));
+    if (!identifier)
+        return nullptr;
     char* nameStorage = reinterpret_cast<char*>(identifier + 1);
     memcpy(nameStorage, name, nameLen + 1);
     identifier->isString = true;
@@ -75,12 +86,15 @@ void _NPN_GetStringIdentifiers(const NPUTF8** names, int32_t nameCount, NPIdenti
 
 NPIdentifier _NPN_GetIntIdentifier(int32_t intId)
 {
+    base::AutoLock lock(identifierMapLock());
     auto& identMap = intIdentifierMap();
     auto it = identMap.find(intId);
     if (it != identMap.end())
         return static_cast<NPIdentifier>(it->second);
 
     auto* identifier = static_cast<content::PrivateIdentifier*>(malloc(sizeof(content::PrivateIdentifier)));
+    if (!identifier)
+        return nullptr;
     identifier->isString = false;
     identifier->value.number = intId;
     identMap.emplace(intId, identifier);
@@ -103,6 +117,8 @@ NPUTF8* _NPN_UTF8FromIdentifier(NPIdentifier identifier)
         return nullptr;
     size_t len = strlen(priv->value.string);
     auto* copy = static_cast<NPUTF8*>(malloc(len + 1));
+    if (!copy)
+        return nullptr;
     memcpy(copy, priv->value.string, len + 1);
     return copy;
 }
@@ -163,7 +179,7 @@ void _NPN_DeallocateObject(NPObject* npObject)
     if (_NPN_IsAlive(npObject))
         _NPN_UnregisterObject(npObject);
 
-    npObject->referenceCount = 0xFFFFFFFF;
+    npObject->referenceCount = 0;
     if (npObject->_class && npObject->_class->deallocate)
         npObject->_class->deallocate(npObject);
     else
@@ -182,9 +198,13 @@ void _NPN_InitializeVariantWithStringCopy(NPVariant* variant, const NPString* va
 {
     if (!variant || !value)
         return;
+    auto* copy = static_cast<NPUTF8*>(malloc(value->UTF8Length + 1));
+    if (!copy) {
+        VOID_TO_NPVARIANT(*variant);
+        return;
+    }
     variant->type = NPVariantType_String;
     variant->value.stringValue.UTF8Length = value->UTF8Length;
-    auto* copy = static_cast<NPUTF8*>(malloc(value->UTF8Length + 1));
     if (value->UTF8Length > 0 && value->UTF8Characters)
         memcpy(copy, value->UTF8Characters, value->UTF8Length);
     copy[value->UTF8Length] = '\0';

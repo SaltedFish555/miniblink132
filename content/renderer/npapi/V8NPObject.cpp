@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace content {
 
@@ -44,38 +45,68 @@ struct NPWrapperEntry {
     v8::Global<v8::Object> wrapper;
 };
 
-std::unordered_map<NPObject*, NPWrapperEntry*>& npWrapperMap()
+std::unordered_map<NPObject*, std::vector<NPWrapperEntry*>>& npWrapperMap()
 {
-    static auto* s_map = new std::unordered_map<NPObject*, NPWrapperEntry*>();
+    static auto* s_map = new std::unordered_map<NPObject*, std::vector<NPWrapperEntry*>>();
     return *s_map;
 }
 
-void onWrapperWeakCallback(const v8::WeakCallbackInfo<NPWrapperEntry>& data)
+void removeEntryFromWrapperMap(NPObject* npObj, NPWrapperEntry* entry)
+{
+    if (!npObj)
+        return;
+    auto& map = npWrapperMap();
+    auto it = map.find(npObj);
+    if (it == map.end())
+        return;
+    auto& bucket = it->second;
+    for (auto vit = bucket.begin(); vit != bucket.end(); ++vit) {
+        if (*vit == entry) {
+            bucket.erase(vit);
+            break;
+        }
+    }
+    if (bucket.empty())
+        map.erase(it);
+}
+
+void onWrapperSecondPassWeakCallback(const v8::WeakCallbackInfo<NPWrapperEntry>& data)
 {
     NPWrapperEntry* entry = data.GetParameter();
     if (!entry)
         return;
 
     NPObject* npObj = entry->npObject;
-    entry->wrapper.Reset();
-    if (npObj) {
-        npWrapperMap().erase(npObj);
-        if (_NPN_IsAlive(npObj))
-            _NPN_ReleaseObject(npObj);
-    }
     delete entry;
+    if (npObj && _NPN_IsAlive(npObj))
+        _NPN_ReleaseObject(npObj);
+}
+
+void onWrapperFirstPassWeakCallback(const v8::WeakCallbackInfo<NPWrapperEntry>& data)
+{
+    NPWrapperEntry* entry = data.GetParameter();
+    if (!entry)
+        return;
+
+    // First-pass GC callback: only reset the V8 handle and unlink map entry.
+    // Defer releasing the NPObject (which may call into plugin deallocate/V8) to second pass.
+    entry->wrapper.Reset();
+    removeEntryFromWrapperMap(entry->npObject, entry);
+    data.SetSecondPassCallback(onWrapperSecondPassWeakCallback);
 }
 
 void throwNPReferenceError(v8::Isolate* isolate, const char* msg)
 {
-    v8::Local<v8::String> str = v8::String::NewFromUtf8(isolate, msg).ToLocalChecked();
-    isolate->ThrowException(v8::Exception::ReferenceError(str));
+    v8::Local<v8::String> str;
+    if (v8::String::NewFromUtf8(isolate, msg).ToLocal(&str))
+        isolate->ThrowException(v8::Exception::ReferenceError(str));
 }
 
 void throwNPGeneralError(v8::Isolate* isolate, const char* msg)
 {
-    v8::Local<v8::String> str = v8::String::NewFromUtf8(isolate, msg).ToLocalChecked();
-    isolate->ThrowException(v8::Exception::Error(str));
+    v8::Local<v8::String> str;
+    if (v8::String::NewFromUtf8(isolate, msg).ToLocal(&str))
+        isolate->ThrowException(v8::Exception::Error(str));
 }
 
 void npObjectInvokeImpl(const v8::FunctionCallbackInfo<v8::Value>& info, InvokeFunctionType functionId)
@@ -126,7 +157,7 @@ void npObjectInvokeImpl(const v8::FunctionCallbackInfo<v8::Value>& info, InvokeF
     VOID_TO_NPVARIANT(result);
 
     v8::TryCatch tryCatch(isolate);
-    bool retval = true;
+    bool retval = false;
     switch (functionId) {
     case kInvokeMethod:
         if (npObject->_class->invoke && !methodName.IsEmpty()) {
@@ -135,7 +166,7 @@ void npObjectInvokeImpl(const v8::FunctionCallbackInfo<v8::Value>& info, InvokeF
         }
         break;
     case kInvokeConstruct:
-        if (npObject->_class->construct)
+        if (NP_CLASS_STRUCT_VERSION_HAS_CTOR(npObject->_class) && npObject->_class->construct)
             retval = npObject->_class->construct(npObject, npArgs.get(), numArgs, &result);
         break;
     case kInvokeDefault:
@@ -203,14 +234,26 @@ v8::Intercepted npObjectGetImpl(
         return v8::Intercepted::kNo;
 
     ScopedNPRetain retain(npObject);
+    v8::TryCatch tryCatch(isolate);
 
     if (npObject->_class->hasProperty && npObject->_class->getProperty && npObject->_class->hasProperty(npObject, identifier)) {
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
         if (!_NPN_IsAlive(npObject))
             return v8::Intercepted::kNo;
 
         NPVariant result;
         VOID_TO_NPVARIANT(result);
-        if (!npObject->_class->getProperty(npObject, identifier, &result)) {
+        bool ok = npObject->_class->getProperty(npObject, identifier, &result);
+        if (tryCatch.HasCaught()) {
+            _NPN_ReleaseVariantValue(&result);
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
+        if (!ok) {
+            _NPN_ReleaseVariantValue(&result);
             info.GetReturnValue().Set(v8::Undefined(isolate));
             return v8::Intercepted::kYes;
         }
@@ -223,10 +266,18 @@ v8::Intercepted npObjectGetImpl(
         return v8::Intercepted::kYes;
     }
 
+    if (tryCatch.HasCaught()) {
+        tryCatch.ReThrow();
+        return v8::Intercepted::kYes;
+    }
     if (!_NPN_IsAlive(npObject) || !npObject->_class)
         return v8::Intercepted::kNo;
 
     if (key->IsString() && npObject->_class->hasMethod && npObject->_class->hasMethod(npObject, identifier)) {
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
         if (!_NPN_IsAlive(npObject))
             return v8::Intercepted::kNo;
 
@@ -241,6 +292,10 @@ v8::Intercepted npObjectGetImpl(
             return v8::Intercepted::kNo;
         fn->SetName(key.As<v8::String>());
         info.GetReturnValue().Set(fn);
+        return v8::Intercepted::kYes;
+    }
+    if (tryCatch.HasCaught()) {
+        tryCatch.ReThrow();
         return v8::Intercepted::kYes;
     }
 
@@ -295,8 +350,9 @@ v8::Intercepted npObjectSetImpl(v8::Isolate* isolate, v8::Local<v8::Object> hold
         return v8::Intercepted::kNo;
 
     ScopedNPRetain retain(npObject);
+    v8::TryCatch tryCatch(isolate);
 
-    if (npObject->_class->hasProperty && npObject->_class->setProperty && npObject->_class->hasProperty(npObject, identifier)) {
+    if (npObject->_class->setProperty) {
         if (!_NPN_IsAlive(npObject))
             return v8::Intercepted::kNo;
 
@@ -305,6 +361,10 @@ v8::Intercepted npObjectSetImpl(v8::Isolate* isolate, v8::Local<v8::Object> hold
         convertV8ObjectToNPVariant(isolate, context, value, npObject, &npValue);
         bool success = npObject->_class->setProperty(npObject, identifier, &npValue);
         _NPN_ReleaseVariantValue(&npValue);
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
         return success ? v8::Intercepted::kYes : v8::Intercepted::kNo;
     }
     return v8::Intercepted::kNo;
@@ -350,12 +410,26 @@ v8::Intercepted npObjectDeleteImpl(
         return v8::Intercepted::kNo;
 
     ScopedNPRetain retain(npObject);
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::TryCatch tryCatch(isolate);
 
     if (npObject->_class->hasProperty && npObject->_class->removeProperty && npObject->_class->hasProperty(npObject, identifier)) {
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
         if (!_NPN_IsAlive(npObject))
             return v8::Intercepted::kNo;
         bool removed = npObject->_class->removeProperty(npObject, identifier);
+        if (tryCatch.HasCaught()) {
+            tryCatch.ReThrow();
+            return v8::Intercepted::kYes;
+        }
         info.GetReturnValue().Set(removed);
+        return v8::Intercepted::kYes;
+    }
+    if (tryCatch.HasCaught()) {
+        tryCatch.ReThrow();
         return v8::Intercepted::kYes;
     }
     return v8::Intercepted::kNo;
@@ -384,11 +458,19 @@ void npObjectPropertyEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info,
         return;
 
     ScopedNPRetain retain(npObject);
+    v8::TryCatch tryCatch(isolate);
 
     if (NP_CLASS_STRUCT_VERSION_HAS_ENUM(npObject->_class) && npObject->_class->enumerate) {
         uint32_t count = 0;
         NPIdentifier* identifiers = nullptr;
-        if (npObject->_class->enumerate(npObject, &identifiers, &count)) {
+        bool ok = npObject->_class->enumerate(npObject, &identifiers, &count);
+        if (tryCatch.HasCaught()) {
+            if (identifiers)
+                NPN_MemFree(identifiers);
+            tryCatch.ReThrow();
+            return;
+        }
+        if (ok) {
             uint32_t matchCount = 0;
             if (identifiers) {
                 for (uint32_t i = 0; i < count; ++i) {
@@ -404,9 +486,13 @@ void npObjectPropertyEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info,
                     auto* id = static_cast<PrivateIdentifier*>(identifiers[i]);
                     if (!id || id->isString != namedProperty)
                         continue;
-                    v8::Local<v8::Value> val = namedProperty
-                        ? v8::String::NewFromUtf8(isolate, id->value.string ? id->value.string : "").ToLocalChecked().As<v8::Value>()
-                        : v8::Integer::New(isolate, id->value.number).As<v8::Value>();
+                    v8::Local<v8::Value> val;
+                    if (namedProperty) {
+                        val = v8::String::NewFromUtf8(isolate, id->value.string ? id->value.string : "")
+                                  .FromMaybe(v8::String::Empty(isolate));
+                    } else {
+                        val = v8::Integer::New(isolate, id->value.number);
+                    }
                     (void)arr->Set(context, outIdx++, val);
                 }
                 NPN_MemFree(identifiers);
@@ -456,8 +542,16 @@ v8::Local<v8::Object> createV8ObjectForNPObject(v8::Isolate* isolate, v8::Local<
         return v8NPObject->v8Object.Get(isolate);
 
     auto existingIt = npWrapperMap().find(object);
-    if (existingIt != npWrapperMap().end() && !existingIt->second->wrapper.IsEmpty())
-        return existingIt->second->wrapper.Get(isolate);
+    if (existingIt != npWrapperMap().end()) {
+        for (NPWrapperEntry* existing : existingIt->second) {
+            if (!existing || existing->wrapper.IsEmpty())
+                continue;
+            v8::Local<v8::Object> existingObj = existing->wrapper.Get(isolate);
+            v8::Local<v8::Context> existingCtx;
+            if (existingObj->GetCreationContext(isolate).ToLocal(&existingCtx) && existingCtx == context)
+                return existingObj;
+        }
+    }
 
     if (g_npObjectTemplate.IsEmpty()) {
         v8::Local<v8::FunctionTemplate> templ = v8::FunctionTemplate::New(isolate);
@@ -501,8 +595,8 @@ v8::Local<v8::Object> createV8ObjectForNPObject(v8::Isolate* isolate, v8::Local<
     auto* entry = new NPWrapperEntry();
     entry->npObject = object;
     entry->wrapper.Reset(isolate, wrapper);
-    entry->wrapper.SetWeak(entry, onWrapperWeakCallback, v8::WeakCallbackType::kParameter);
-    npWrapperMap()[object] = entry;
+    entry->wrapper.SetWeak(entry, onWrapperFirstPassWeakCallback, v8::WeakCallbackType::kParameter);
+    npWrapperMap()[object].push_back(entry);
 
     return wrapper;
 }
@@ -516,22 +610,29 @@ void forgetV8ObjectForNPObject(NPObject* object)
     if (it == npWrapperMap().end())
         return;
 
-    NPWrapperEntry* entry = it->second;
+    std::vector<NPWrapperEntry*> entries = std::move(it->second);
     npWrapperMap().erase(it);
 
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    if (isolate && !entry->wrapper.IsEmpty()) {
-        v8::HandleScope scope(isolate);
-        v8::Local<v8::Object> wrapper = entry->wrapper.Get(isolate);
-        if (wrapper->InternalFieldCount() == 2) {
-            wrapper->SetAlignedPointerInInternalField(0, nullptr);
-            wrapper->SetAlignedPointerInInternalField(1, nullptr);
+    size_t releaseCount = 0;
+    for (NPWrapperEntry* entry : entries) {
+        if (!entry)
+            continue;
+        if (isolate && !entry->wrapper.IsEmpty()) {
+            v8::HandleScope scope(isolate);
+            v8::Local<v8::Object> wrapper = entry->wrapper.Get(isolate);
+            if (wrapper->InternalFieldCount() == 2) {
+                wrapper->SetAlignedPointerInInternalField(0, nullptr);
+                wrapper->SetAlignedPointerInInternalField(1, nullptr);
+            }
         }
+        entry->wrapper.Reset();
+        delete entry;
+        ++releaseCount;
     }
-    entry->wrapper.Reset();
-    delete entry;
 
-    _NPN_ReleaseObject(object);
+    for (size_t i = 0; i < releaseCount; ++i)
+        _NPN_ReleaseObject(object);
 }
 
 } // namespace content

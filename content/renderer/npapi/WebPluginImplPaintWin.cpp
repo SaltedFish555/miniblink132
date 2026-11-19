@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include "base/functional/bind.h"
 #include "base/task/single_thread_task_runner.h"
@@ -12,6 +13,8 @@
 #include "cc/paint/paint_canvas.h"
 #include "cc/paint/paint_image.h"
 #include "cc/paint/paint_image_builder.h"
+#include "content/browser/MbWebview.h"
+#include "content/common/LiveIdDetect.h"
 #include "content/renderer/npapi/PluginMessageThrottlerWin.h"
 #include "third_party/blink/public/web/web_plugin_container.h"
 #include "third_party/skia/include/core/SkImage.h"
@@ -112,7 +115,7 @@ LRESULT CALLBACK destroyNullWndProc(HWND, UINT, WPARAM, LPARAM)
 void destroyPluginWindowAsync(intptr_t widgetAddr)
 {
     HWND widget = reinterpret_cast<HWND>(widgetAddr);
-    if (!widget)
+    if (!widget || !::IsWindow(widget))
         return;
     if (::IsWindowUnicode(widget))
         ::SetWindowLongPtrW(widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&destroyNullWndProc));
@@ -220,6 +223,10 @@ LRESULT WebPluginImpl::wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
 
+    UINT prevLastMessage = m_lastMessage;
+    bool prevCallingWndProc = m_isCallingPluginWndProc;
+    HDC prevWmPrintHDC = m_wmPrintHDC;
+
     m_lastMessage = message;
     m_isCallingPluginWndProc = true;
 
@@ -236,8 +243,9 @@ LRESULT WebPluginImpl::wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
     }
 
     LRESULT result = m_pluginWndProc ? ::CallWindowProcW(m_pluginWndProc, hWnd, message, wParam, lParam) : 0;
-    m_wmPrintHDC = nullptr;
-    m_isCallingPluginWndProc = false;
+    m_wmPrintHDC = prevWmPrintHDC;
+    m_isCallingPluginWndProc = prevCallingWndProc;
+    m_lastMessage = prevLastMessage;
     return result;
 #else
     return 0;
@@ -298,15 +306,28 @@ void WebPluginImpl::releaseBackingDib()
 #endif
     m_memoryPixels = nullptr;
     m_memoryCanvasSize = { 0, 0 };
+    m_lastPaintHDC = nullptr;
 }
 
 void WebPluginImpl::setRgnIfNeeded(const gfx::Rect& windowRect, const gfx::Rect& oldWindowRect, const gfx::Rect& oldClipRect)
 {
     if (!m_plugin)
         return;
+
+    if (m_mbwebviewId) {
+        if (auto* webview = static_cast<MbWebView*>(common::LiveIdDetect::getMbWebviewIds()->getPtr(m_mbwebviewId))) {
+            POINT latestOffset = webview->getOffset();
+            m_widgetOffset.SetPoint(latestOffset.x, latestOffset.y);
+            if (!m_parentWidget)
+                m_parentWidget = webview->getHostWnd();
+        }
+    }
+
     if (m_haveUpdatedPluginWidget && m_windowRect == oldWindowRect && m_clipRect == oldClipRect)
         return;
 
+    scoped_refptr<WebPluginImpl> protect(this);
+    ScopedCurrentPluginView currentGuard(this);
     setCallingPlugin(true);
 #if defined(_WIN32)
     if (m_widget) {
@@ -383,6 +404,9 @@ bool WebPluginImpl::dispatchNPEvent(NPEvent& npEvent)
     if (!m_plugin || !m_plugin->pluginFuncs()->event || !m_instance)
         return true;
 
+    scoped_refptr<WebPluginImpl> protect(this);
+    ScopedCurrentPluginView currentGuard(this);
+
     bool shouldPop = false;
     if (m_plugin->pluginFuncs()->version < NPVERS_HAS_POPUPS_ENABLED_STATE && isWindowsMessageUserGesture(npEvent.event)) {
         pushPopupsEnabledState(true);
@@ -406,6 +430,9 @@ void WebPluginImpl::setNPWindowRect(const gfx::Rect& rect)
 {
     if (!m_isStarted || !m_plugin || !m_instance)
         return;
+
+    scoped_refptr<WebPluginImpl> protect(this);
+    ScopedCurrentPluginView currentGuard(this);
 
     int w = std::max(0, rect.width());
     int h = std::max(0, rect.height());
@@ -433,11 +460,16 @@ void WebPluginImpl::setNPWindowRect(const gfx::Rect& rect)
     }
 
     if (m_plugin->pluginFuncs()->setwindow) {
+        if (m_haveCalledSetWindow && m_plugin->quirks().contains(PluginQuirkDontCallSetWindowMoreThanOnce))
+            return;
+
         setCallingPlugin(true);
         bool needSetWindow = (m_npWindow.width != 1 || m_npWindow.height != 1)
             || (m_plugin->name().Utf8().find("GZBank") == std::string::npos);
-        if (needSetWindow)
+        if (needSetWindow) {
             m_plugin->pluginFuncs()->setwindow(m_instance, &m_npWindow);
+            m_lastSetWindowSize = gfx::Size(w, h);
+        }
         setCallingPlugin(false);
         m_haveCalledSetWindow = true;
 
@@ -456,34 +488,43 @@ void WebPluginImpl::setNPWindowRect(const gfx::Rect& rect)
 void WebPluginImpl::paintIntoTransformedContext(HDC hdc)
 {
 #if defined(_WIN32)
-    if (m_isWindowed || !hdc)
+    if (m_isWindowed || !hdc || !m_isStarted)
         return;
 
     m_npWindow.type = NPWindowTypeDrawable;
     m_npWindow.window = hdc;
 
-    int w = m_windowRect.width() > 0 ? m_windowRect.width() : 1;
-    int h = m_windowRect.height() > 0 ? m_windowRect.height() : 1;
-    gfx::Rect localRect(0, 0, w, h);
+    int w = m_memoryCanvasSize.cx > 0 ? m_memoryCanvasSize.cx : (m_windowRect.width() > 0 ? m_windowRect.width() : 1);
+    int h = m_memoryCanvasSize.cy > 0 ? m_memoryCanvasSize.cy : (m_windowRect.height() > 0 ? m_windowRect.height() : 1);
+    gfx::Size targetSize(w, h);
 
-    WINDOWPOS windowpos {};
-    windowpos.x = 0;
-    windowpos.y = 0;
-    windowpos.cx = w;
-    windowpos.cy = h;
+    if (!m_haveCalledSetWindow || m_lastPaintHDC != hdc || m_lastSetWindowSize != targetSize) {
+        WINDOWPOS windowpos {};
+        windowpos.x = 0;
+        windowpos.y = 0;
+        windowpos.cx = w;
+        windowpos.cy = h;
 
-    NPEvent npEvent {};
-    npEvent.event = WM_WINDOWPOSCHANGED;
-    npEvent.lParam = reinterpret_cast<uintptr_t>(&windowpos);
-    npEvent.wParam = 0;
-    dispatchNPEvent(npEvent);
+        NPEvent posEvent {};
+        posEvent.event = WM_WINDOWPOSCHANGED;
+        posEvent.lParam = reinterpret_cast<uintptr_t>(&windowpos);
+        posEvent.wParam = 0;
+        dispatchNPEvent(posEvent);
 
-    setNPWindowRect(localRect);
+        if (!m_isStarted)
+            return;
+        setNPWindowRect(gfx::Rect(0, 0, w, h));
+        m_lastPaintHDC = hdc;
+    }
 
-    npEvent.event = WM_PAINT;
-    npEvent.wParam = reinterpret_cast<uintptr_t>(hdc);
-    npEvent.lParam = 0;
-    dispatchNPEvent(npEvent);
+    if (!m_isStarted)
+        return;
+
+    NPEvent paintEvent {};
+    paintEvent.event = WM_PAINT;
+    paintEvent.wParam = reinterpret_cast<uintptr_t>(hdc);
+    paintEvent.lParam = 0;
+    dispatchNPEvent(paintEvent);
 #endif
 }
 
@@ -492,16 +533,21 @@ void WebPluginImpl::Paint(cc::PaintCanvas* canvas, const gfx::Rect& rect)
     if (!m_isStarted || !canvas || !m_pluginContainer)
         return;
 
+    scoped_refptr<WebPluginImpl> protect(this);
+    ScopedCurrentPluginView currentGuard(this);
+
     if (!m_haveCalledSetWindow) {
         gfx::Rect initRect = m_windowRect.IsEmpty() ? rect : m_windowRect;
         setNPWindowRect(initRect);
+        if (!m_isStarted)
+            return;
     }
 
     if (m_isWindowed)
         return;
 
-    int width = m_windowRect.width();
-    int height = m_windowRect.height();
+    int width = m_windowRect.width() > 0 ? m_windowRect.width() : rect.width();
+    int height = m_windowRect.height() > 0 ? m_windowRect.height() : rect.height();
     if (width <= 0 || height <= 0)
         return;
 
@@ -518,10 +564,57 @@ void WebPluginImpl::Paint(cc::PaintCanvas* canvas, const gfx::Rect& rect)
 
 #if defined(_WIN32)
     paintIntoTransformedContext(m_memoryDC);
-#endif
+    if (!m_isStarted || !m_memoryPixels || !m_pluginContainer)
+        return;
 
+    if (m_isTransparent) {
+        auto* pixels = static_cast<uint32_t*>(m_memoryPixels);
+        size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+        bool hasNonZeroAlpha = false;
+        for (size_t i = 0; i < pixelCount; ++i) {
+            if (pixels[i] & 0xFF000000u) {
+                hasNonZeroAlpha = true;
+                break;
+            }
+        }
+        // Standard Win32 GDI calls leave the alpha byte 0 in 32-bit DIBs.
+        // Recover true premultiplied alpha via a second pass on a white backdrop.
+        if (!hasNonZeroAlpha) {
+            std::vector<uint32_t> blackPixels(pixels, pixels + pixelCount);
+            memset(m_memoryPixels, 0xFF, byteSize);
+            paintIntoTransformedContext(m_memoryDC);
+            if (!m_isStarted || !m_memoryPixels || !m_pluginContainer)
+                return;
+            pixels = static_cast<uint32_t*>(m_memoryPixels);
+            for (size_t i = 0; i < pixelCount; ++i) {
+                uint32_t bPx = blackPixels[i];
+                uint32_t wPx = pixels[i];
+                int bB = static_cast<int>(bPx & 0xFFu);
+                int bG = static_cast<int>((bPx >> 8) & 0xFFu);
+                int bR = static_cast<int>((bPx >> 16) & 0xFFu);
+                int wB = static_cast<int>(wPx & 0xFFu);
+                int wG = static_cast<int>((wPx >> 8) & 0xFFu);
+                int wR = static_cast<int>((wPx >> 16) & 0xFFu);
+                int aB = std::clamp(255 - (wB - bB), 0, 255);
+                int aG = std::clamp(255 - (wG - bG), 0, 255);
+                int aR = std::clamp(255 - (wR - bR), 0, 255);
+                int a = (aR + aG + aB + 1) / 3;
+                int outR = std::min(bR, a);
+                int outG = std::min(bG, a);
+                int outB = std::min(bB, a);
+                pixels[i] = (static_cast<uint32_t>(a) << 24)
+                    | (static_cast<uint32_t>(outR) << 16)
+                    | (static_cast<uint32_t>(outG) << 8)
+                    | static_cast<uint32_t>(outB);
+            }
+        }
+    } else {
+        forceOpaqueAlphaChannel(m_memoryPixels, byteSize);
+    }
+#else
     if (!m_isTransparent)
         forceOpaqueAlphaChannel(m_memoryPixels, byteSize);
+#endif
 
     SkImageInfo imgInfo = SkImageInfo::MakeN32Premul(width, height);
     SkPixmap pixmap(imgInfo, m_memoryPixels, static_cast<size_t>(width) * 4);
@@ -546,10 +639,15 @@ bool WebPluginImpl::platformGetValueStatic(NPNVariable, void*, NPError*)
 bool WebPluginImpl::platformGetValue(NPNVariable variable, void* value, NPError* result)
 {
     switch (variable) {
-    case NPNVnetscapeWindow:
+    case NPNVnetscapeWindow: {
+        if (!m_widget && !m_parentWidget && m_mbwebviewId) {
+            if (auto* webview = static_cast<MbWebView*>(common::LiveIdDetect::getMbWebviewIds()->getPtr(m_mbwebviewId)))
+                m_parentWidget = webview->getHostWnd();
+        }
         *reinterpret_cast<HWND*>(value) = m_widget ? m_widget : m_parentWidget;
         *result = NPERR_NO_ERROR;
         return true;
+    }
     case NPNVSupportsWindowless:
         *reinterpret_cast<NPBool*>(value) = TRUE;
         *result = NPERR_NO_ERROR;

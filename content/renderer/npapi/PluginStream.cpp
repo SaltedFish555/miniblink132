@@ -12,6 +12,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
 #include "base/task/single_thread_task_runner.h"
+#include "content/renderer/npapi/WebPluginImpl.h"
 #include "mbnet/WebURLLoaderImplCurl.h"
 #include "third_party/blink/public/platform/web_http_header_visitor.h"
 
@@ -20,6 +21,37 @@ namespace content {
 namespace {
 
 constexpr NPReason kWebReasonNone = -2;
+
+std::string filePathToPluginAnsi(const base::FilePath& path)
+{
+#if defined(_WIN32)
+    const std::wstring& wide = path.value();
+    if (wide.empty())
+        return std::string();
+
+    std::wstring pathForAnsi = wide;
+    DWORD shortLen = ::GetShortPathNameW(wide.c_str(), nullptr, 0);
+    if (shortLen > 0) {
+        std::wstring shortBuf(shortLen, L'\0');
+        DWORD written = ::GetShortPathNameW(wide.c_str(), shortBuf.data(), shortLen);
+        if (written > 0 && written < shortLen) {
+            shortBuf.resize(written);
+            pathForAnsi = std::move(shortBuf);
+        }
+    }
+
+    int ansiLen = ::WideCharToMultiByte(CP_ACP, 0, pathForAnsi.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (ansiLen > 1) {
+        std::string ansi(static_cast<size_t>(ansiLen), '\0');
+        int written = ::WideCharToMultiByte(CP_ACP, 0, pathForAnsi.c_str(), -1, ansi.data(), ansiLen, nullptr, nullptr);
+        if (written > 1) {
+            ansi.resize(static_cast<size_t>(written - 1));
+            return ansi;
+        }
+    }
+#endif
+    return path.AsUTF8Unsafe();
+}
 
 std::map<NPStream*, NPP>& streamMap()
 {
@@ -49,21 +81,23 @@ private:
 
 scoped_refptr<PluginStream> PluginStream::create(PluginStreamClient* client, int64_t mbwebviewId,
     std::unique_ptr<network::ResourceRequest> request, scoped_refptr<const blink::SecurityOrigin> topFrameOrigin,
-    bool sendNotification, void* notifyData, const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks)
+    bool sendNotification, void* notifyData, scoped_refptr<PluginPackage> pluginPackage,
+    const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks)
 {
     return base::WrapRefCounted(new PluginStream(client, mbwebviewId, std::move(request),
-        std::move(topFrameOrigin), sendNotification, notifyData, pluginFuncs, instance, quirks));
+        std::move(topFrameOrigin), sendNotification, notifyData, std::move(pluginPackage), pluginFuncs, instance, quirks));
 }
 
 PluginStream::PluginStream(PluginStreamClient* client, int64_t mbwebviewId, std::unique_ptr<network::ResourceRequest> request,
     scoped_refptr<const blink::SecurityOrigin> topFrameOrigin, bool sendNotification, void* notifyData,
-    const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks)
+    scoped_refptr<PluginPackage> pluginPackage, const NPPluginFuncs* pluginFuncs, NPP instance, const PluginQuirkSet& quirks)
     : m_client(client)
     , m_mbwebviewId(mbwebviewId)
     , m_request(std::move(request))
     , m_topFrameOrigin(std::move(topFrameOrigin))
     , m_notifyData(notifyData)
     , m_sendNotification(sendNotification)
+    , m_pluginPackage(std::move(pluginPackage))
     , m_pluginFuncs(pluginFuncs)
     , m_instance(instance)
     , m_reason(kWebReasonNone)
@@ -110,6 +144,7 @@ void PluginStream::stop()
 {
     scoped_refptr<PluginStream> protect(this);
     m_streamState = StreamStopped;
+    m_stream.ndata = nullptr;
     m_delayDeliveryTimer.Stop();
     if (m_bodyWatcher) {
         m_bodyWatcher->Cancel();
@@ -130,7 +165,7 @@ void PluginStream::stop()
 
 void PluginStream::startStream()
 {
-    if (m_streamState != StreamBeforeStarted)
+    if (m_streamState != StreamBeforeStarted || !m_pluginFuncs || !m_pluginFuncs->newstream || !WebPluginImpl::isAlive(m_instance))
         return;
 
     blink::KURL responseURL(m_resourceResponse.CurrentRequestUrl());
@@ -145,7 +180,10 @@ void PluginStream::startStream()
 
     int64_t expectedContentLength = m_resourceResponse.ExpectedContentLength();
     if (responseURL.ProtocolIsInHTTPFamily()) {
-        m_headersStorage = "HTTP " + base::NumberToString(m_resourceResponse.HttpStatusCode()) + " OK\n";
+        std::string statusText = m_resourceResponse.HttpStatusText().Utf8();
+        if (statusText.empty())
+            statusText = (m_resourceResponse.HttpStatusCode() == 200) ? "OK" : "Status";
+        m_headersStorage = "HTTP/1.1 " + base::NumberToString(m_resourceResponse.HttpStatusCode()) + " " + statusText + "\n";
         ResponseHeaderBuilder visitor(&m_headersStorage);
         m_resourceResponse.VisitHttpHeaderFields(&visitor);
 
@@ -168,11 +206,16 @@ void PluginStream::startStream()
     scoped_refptr<PluginStream> protect(this);
 
     setDefersLoading(true);
-    NPError npErr = m_pluginFuncs->newstream(
-        m_instance, const_cast<NPMIMEType>(mimeTypeStr.c_str()), &m_stream, false, &m_transferMode);
+    NPError npErr = NPERR_GENERIC_ERROR;
+    {
+        WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+        npErr = m_pluginFuncs->newstream(
+            m_instance, const_cast<NPMIMEType>(mimeTypeStr.c_str()), &m_stream, false, &m_transferMode);
+    }
     setDefersLoading(false);
 
-    if (m_reason != kWebReasonNone)
+    // Reentrancy during NPP_NewStream may have stopped/destroyed the stream or plugin instance.
+    if (m_streamState == StreamStopped || m_reason != kWebReasonNone || !WebPluginImpl::isAlive(m_instance))
         return;
 
     if (npErr != NPERR_NO_ERROR) {
@@ -224,38 +267,48 @@ void PluginStream::destroyStreamImpl()
         m_tempFile.Close();
 
     bool newStreamCalled = (m_stream.ndata != nullptr);
-    if (newStreamCalled) {
+    if (newStreamCalled && m_pluginFuncs && WebPluginImpl::isAlive(m_instance)) {
         if (m_reason == NPRES_DONE && (m_transferMode == NP_ASFILE || m_transferMode == NP_ASFILEONLY)
             && !m_tempFilePath.empty() && m_pluginFuncs->asfile) {
             setDefersLoading(true);
-            std::string utf8TempPath = m_tempFilePath.AsUTF8Unsafe();
-            m_pluginFuncs->asfile(m_instance, &m_stream, utf8TempPath.c_str());
+            std::string ansiTempPath = filePathToPluginAnsi(m_tempFilePath);
+            {
+                WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+                m_pluginFuncs->asfile(m_instance, &m_stream, ansiTempPath.c_str());
+            }
             setDefersLoading(false);
         }
 
-        if (m_streamState != StreamBeforeStarted && m_pluginFuncs->destroystream) {
+        if (m_streamState == StreamStarted && m_pluginFuncs->destroystream && WebPluginImpl::isAlive(m_instance)) {
             setDefersLoading(true);
-            m_pluginFuncs->destroystream(m_instance, &m_stream, m_reason);
+            {
+                WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+                m_pluginFuncs->destroystream(m_instance, &m_stream, m_reason);
+            }
             setDefersLoading(false);
         }
         m_stream.ndata = nullptr;
     }
 
-    if (m_sendNotification && m_pluginFuncs->urlnotify) {
+    if (m_streamState != StreamStopped && m_sendNotification && m_pluginFuncs && m_pluginFuncs->urlnotify && WebPluginImpl::isAlive(m_instance)) {
         setDefersLoading(true);
-        if (!newStreamCalled && m_quirks.contains(PluginQuirkFlashURLNotifyBug)
-            && base::EqualsCaseInsensitiveASCII(m_requestMethod, "POST")) {
-            m_transferMode = NP_NORMAL;
-            m_stream.url = "";
-            m_stream.notifyData = m_notifyData;
-            static char kEmptyMimeType[] = "";
-            if (m_pluginFuncs->newstream)
-                m_pluginFuncs->newstream(m_instance, kEmptyMimeType, &m_stream, false, &m_transferMode);
-            if (m_pluginFuncs->destroystream)
-                m_pluginFuncs->destroystream(m_instance, &m_stream, m_reason);
-            m_stream.url = nullptr;
+        {
+            WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+            if (!newStreamCalled && m_quirks.contains(PluginQuirkFlashURLNotifyBug)
+                && base::EqualsCaseInsensitiveASCII(m_requestMethod, "POST")) {
+                m_transferMode = NP_NORMAL;
+                m_stream.url = "";
+                m_stream.notifyData = m_notifyData;
+                static char kEmptyMimeType[] = "";
+                if (m_pluginFuncs->newstream)
+                    m_pluginFuncs->newstream(m_instance, kEmptyMimeType, &m_stream, false, &m_transferMode);
+                if (m_streamState != StreamStopped && WebPluginImpl::isAlive(m_instance) && m_pluginFuncs->destroystream)
+                    m_pluginFuncs->destroystream(m_instance, &m_stream, m_reason);
+                m_stream.url = nullptr;
+            }
+            if (m_streamState != StreamStopped && WebPluginImpl::isAlive(m_instance))
+                m_pluginFuncs->urlnotify(m_instance, m_requestUrlSpec.c_str(), m_reason, m_notifyData);
         }
-        m_pluginFuncs->urlnotify(m_instance, m_requestUrlSpec.c_str(), m_reason, m_notifyData);
         setDefersLoading(false);
     }
 
@@ -277,17 +330,23 @@ void PluginStream::delayDeliveryTimerFired()
 
 void PluginStream::deliverData()
 {
-    if (m_isDeliveringData || m_streamState == StreamStopped || !m_stream.ndata || m_deliveryData.empty())
+    if (m_isDeliveringData || m_streamState == StreamStopped || !m_stream.ndata || m_deliveryData.empty()
+        || !m_pluginFuncs || !m_pluginFuncs->write || !WebPluginImpl::isAlive(m_instance)) {
         return;
+    }
 
     scoped_refptr<PluginStream> protect(this);
     m_isDeliveringData = true;
     setDefersLoading(true);
 
-    while (m_streamState != StreamStopped && m_stream.ndata && !m_deliveryData.empty()) {
+    while (m_streamState != StreamStopped && m_stream.ndata && !m_deliveryData.empty() && WebPluginImpl::isAlive(m_instance)) {
         int32_t totalBytes = static_cast<int32_t>(m_deliveryData.size());
-        int32_t deliveryBytes = m_pluginFuncs->writeready ? m_pluginFuncs->writeready(m_instance, &m_stream) : totalBytes;
-        if (m_streamState == StreamStopped || !m_stream.ndata)
+        int32_t deliveryBytes = totalBytes;
+        if (m_pluginFuncs->writeready) {
+            WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+            deliveryBytes = m_pluginFuncs->writeready(m_instance, &m_stream);
+        }
+        if (m_streamState == StreamStopped || !m_stream.ndata || !WebPluginImpl::isAlive(m_instance))
             break;
 
         if (deliveryBytes <= 0) {
@@ -301,8 +360,12 @@ void PluginStream::deliverData()
         int32_t dataLength = std::min(deliveryBytes, static_cast<int32_t>(m_deliveryData.size()));
         std::vector<char> chunk(m_deliveryData.begin(), m_deliveryData.begin() + dataLength);
 
-        int32_t written = m_pluginFuncs->write(m_instance, &m_stream, m_offset, dataLength, chunk.data());
-        if (m_streamState == StreamStopped || !m_stream.ndata)
+        int32_t written = -1;
+        {
+            WebPluginImpl::ScopedCurrentPluginView currentGuard(WebPluginImpl::fromInstance(m_instance));
+            written = m_pluginFuncs->write(m_instance, &m_stream, m_offset, dataLength, chunk.data());
+        }
+        if (m_streamState == StreamStopped || !m_stream.ndata || !WebPluginImpl::isAlive(m_instance))
             break;
 
         if (written < 0) {

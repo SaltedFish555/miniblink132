@@ -114,6 +114,13 @@ WebPluginImpl::WebPluginImpl(blink::WebLocalFrame* parentFrame, const blink::Web
         return;
     }
 
+    ensureInstanceAllocated();
+}
+
+void WebPluginImpl::ensureInstanceAllocated()
+{
+    if (m_instance || !m_plugin)
+        return;
     m_instance = new NPP_t();
     m_instance->ndata = this;
     m_instance->pdata = nullptr;
@@ -286,22 +293,32 @@ bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
                 m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
                 if (!m_plugin && PluginDatabase::installedPlugins()->refresh())
                     m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
-                if (m_plugin && !m_instance) {
-                    m_instance = new NPP_t();
-                    m_instance->ndata = this;
-                    m_instance->pdata = nullptr;
-                    instanceMap()[m_instance] = this;
+                if (m_plugin) {
+                    ensureInstanceAllocated();
                     m_status = PluginStatusLoadedSuccessfully;
                 }
             }
         }
     }
     init();
+    if (m_status != PluginStatusLoadedSuccessfully || !m_isStarted) {
+        // Detach from WebPluginContainerImpl before self-destroying so Oilpan GC
+        // won't invoke Destroy() a second time on a freed WebPluginImpl, and allow
+        // Blink to render <object> fallback content (e.g. nested <embed>).
+        if (m_pluginContainer)
+            m_pluginContainer->SetPlugin(nullptr);
+        Destroy();
+        return false;
+    }
     return true;
 }
 
 void WebPluginImpl::Destroy()
 {
+    if (m_isDestroyed)
+        return;
+    m_isDestroyed = true;
+
     unregisterManualPlugin();
     m_requestTimer.Stop();
     m_invalidateTimer.Stop();
@@ -340,7 +357,10 @@ void WebPluginImpl::init()
     if (!m_plugin && PluginDatabase::installedPlugins()->refresh())
         m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
 
-    if (!m_plugin || !m_plugin->load()) {
+    if (m_plugin)
+        ensureInstanceAllocated();
+
+    if (!m_plugin || !m_instance || !m_plugin->load()) {
         m_plugin = nullptr;
         m_status = PluginStatusCanNotLoadPlugin;
         return;
@@ -348,8 +368,10 @@ void WebPluginImpl::init()
     m_hasLoadedPlugin = true;
 
     if (!start()) {
-        m_plugin->unload();
-        m_hasLoadedPlugin = false;
+        if (m_hasLoadedPlugin && m_plugin) {
+            m_plugin->unload();
+            m_hasLoadedPlugin = false;
+        }
         m_status = PluginStatusCanNotLoadPlugin;
         return;
     }
@@ -358,7 +380,7 @@ void WebPluginImpl::init()
 
 bool WebPluginImpl::start()
 {
-    if (m_isStarted || !m_plugin || !m_plugin->pluginFuncs()->newp)
+    if (m_isStarted || !m_plugin || !m_instance || !m_plugin->pluginFuncs()->newp)
         return false;
 
     PluginMainThreadScheduler::scheduler().registerPlugin(m_instance);
@@ -388,13 +410,16 @@ bool WebPluginImpl::start()
         req->method = "GET";
         req->url = GURL(m_url.GetString().Utf8());
         req->headers.SetHeader("User-Agent", blink::Platform::Current()->UserAgent().Utf8());
-        req->headers.SetHeader("Referer", m_webFrame->GetDocument().BaseURL().GetString().Utf8());
+        blink::KURL docUrl = m_webFrame->GetDocument().Url();
+        if (docUrl.ProtocolIsInHTTPFamily())
+            req->headers.SetHeader("Referer", docUrl.GetString().Utf8());
         loadRequest(std::move(req), nullptr, false, nullptr);
     }
 
     m_status = PluginStatusLoadedSuccessfully;
     if (!platformStart()) {
         m_status = PluginStatusCanNotLoadPlugin;
+        stop();
         return false;
     }
     return true;
@@ -458,14 +483,18 @@ void WebPluginImpl::findVirtualPluginByMime()
         return;
     for (int i = 0;; ++i) {
         std::string virtualMime = "application/virtual-plugin-" + std::to_string(i);
-        m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, virtualMime);
-        if (!m_plugin)
+        scoped_refptr<PluginPackage> candidate = PluginDatabase::installedPlugins()->findPlugin(m_url, virtualMime);
+        if (!candidate)
             break;
-        if (!m_plugin->load())
+        if (!candidate->load())
             continue;
-        if (m_plugin->pluginFuncs()->newp
-            && m_plugin->pluginFuncs()->newp(const_cast<NPMIMEType>(m_mimeType.c_str()), nullptr, 0, 0, nullptr, nullptr, nullptr) == NPERR_NO_ERROR)
+        bool matched = candidate->pluginFuncs()->newp
+            && candidate->pluginFuncs()->newp(const_cast<NPMIMEType>(m_mimeType.c_str()), nullptr, 0, 0, nullptr, nullptr, nullptr) == NPERR_NO_ERROR;
+        candidate->unload();
+        if (matched) {
+            m_plugin = std::move(candidate);
             break;
+        }
     }
 }
 
@@ -520,9 +549,18 @@ WebPluginImpl* WebPluginImpl::currentPluginView()
     return s_currentPluginView;
 }
 
+WebPluginImpl* WebPluginImpl::fromInstance(NPP instance)
+{
+    if (!instance)
+        return nullptr;
+    auto& map = instanceMap();
+    auto it = map.find(instance);
+    return (it == map.end()) ? nullptr : it->second;
+}
+
 bool WebPluginImpl::isAlive(NPP instance)
 {
-    return instanceMap().find(instance) != instanceMap().end();
+    return instance && instanceMap().find(instance) != instanceMap().end();
 }
 
 void WebPluginImpl::setCallingPlugin(bool calling) const
@@ -660,11 +698,20 @@ NPError WebPluginImpl::getValueStatic(NPNVariable variable, void* value)
 
 NPError WebPluginImpl::getValue(NPNVariable variable, void* value)
 {
+    if (!value)
+        return NPERR_INVALID_PARAM;
+
     NPError result = NPERR_GENERIC_ERROR;
     if (platformGetValue(variable, value, &result) || platformGetValueStatic(variable, value, &result))
         return result;
 
     switch (variable) {
+    case NPNVjavascriptEnabledBool:
+        *static_cast<NPBool*>(value) = TRUE;
+        return NPERR_NO_ERROR;
+    case NPNVisOfflineBool:
+        *static_cast<NPBool*>(value) = FALSE;
+        return NPERR_NO_ERROR;
     case NPNVWindowNPObject: {
         NPObject* winObj = windowScriptNPObject();
         if (winObj)
@@ -711,7 +758,8 @@ NPError WebPluginImpl::getValueForURL(NPNURLVariable variable, const char* url, 
         if (!webview || !webview->getWebCookieJarImpl())
             return NPERR_GENERIC_ERROR;
 
-        std::string cookieStr = webview->getWebCookieJarImpl()->getCookiesForSession(u, true);
+        // Do not expose HttpOnly cookies to NPAPI plugins.
+        std::string cookieStr = webview->getWebCookieJarImpl()->getCookiesForSession(u, false);
         uint32_t size = static_cast<uint32_t>(cookieStr.size());
         *value = static_cast<char*>(NPN_MemAlloc(size + 1));
         if (!*value)

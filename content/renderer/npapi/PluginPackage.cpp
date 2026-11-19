@@ -170,6 +170,8 @@ void PluginPackage::unload()
         return;
     if (--m_loadCount > 0)
         return;
+    if (m_quirks.contains(PluginQuirkDontUnloadPlugin))
+        return;
     if (m_NPP_Shutdown)
         m_NPP_Shutdown();
     unloadWithoutShutdown();
@@ -238,6 +240,7 @@ void PluginPackage::determineQuirks(const std::string& mimeType)
         m_quirks.add(PluginQuirkThrottleWMUserPlusOneMessages);
         m_quirks.add(PluginQuirkFlashURLNotifyBug);
         m_quirks.add(PluginQuirkEmulateIme);
+        m_quirks.add(PluginQuirkDontUnloadPlugin);
     }
 
     std::string nameUtf8 = m_name.Utf8();
@@ -396,17 +399,10 @@ bool PluginPackage::load()
         return true;
     } else {
 #if defined(_WIN32)
-        WCHAR currentPath[MAX_PATH] = { 0 };
-        if (!::GetCurrentDirectoryW(MAX_PATH, currentPath))
-            return false;
-
+        // Use LOAD_WITH_ALTERED_SEARCH_PATH directly without mutating process-wide CWD
+        // (SetCurrentDirectoryW is thread-unsafe across UI/Blink/network threads).
         std::wstring widePath = base::UTF8ToWide(m_path.Utf8());
-        std::wstring parentDir = base::UTF8ToWide(m_parentDirectory.Utf8());
-        if (!parentDir.empty())
-            ::SetCurrentDirectoryW(parentDir.c_str());
-
         m_module = ::LoadLibraryExW(widePath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        ::SetCurrentDirectoryW(currentPath);
 #endif
     }
 
@@ -538,7 +534,7 @@ int PluginPackage::compare(const PluginPackage& compareTo) const
 
     diff = compareFileVersion(compareTo.version());
     if (diff)
-        return diff;
+        return -diff; // Newer file version sorts first.
 
     return strcmp(parentDirectory().Utf8().c_str(), compareTo.parentDirectory().Utf8().c_str());
 }

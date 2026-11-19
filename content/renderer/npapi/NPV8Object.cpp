@@ -28,6 +28,26 @@ namespace content {
 
 namespace {
 
+class ScopedNPObjectRetain {
+public:
+    explicit ScopedNPObjectRetain(NPObject* obj)
+        : m_obj(obj)
+    {
+        if (m_obj)
+            _NPN_RetainObject(m_obj);
+    }
+    ~ScopedNPObjectRetain()
+    {
+        if (m_obj)
+            _NPN_ReleaseObject(m_obj);
+    }
+    ScopedNPObjectRetain(const ScopedNPObjectRetain&) = delete;
+    ScopedNPObjectRetain& operator=(const ScopedNPObjectRetain&) = delete;
+
+private:
+    NPObject* m_obj;
+};
+
 std::unordered_map<int, std::vector<V8NPObject*>>& v8NPObjectHashMap()
 {
     static auto* s_map = new std::unordered_map<int, std::vector<V8NPObject*>>();
@@ -36,7 +56,11 @@ std::unordered_map<int, std::vector<V8NPObject*>>& v8NPObjectHashMap()
 
 NPObject* allocV8NPObject(NPP, NPClass*)
 {
-    return static_cast<NPObject*>(calloc(1, sizeof(V8NPObject)));
+    void* mem = calloc(1, sizeof(V8NPObject));
+    if (!mem)
+        return nullptr;
+    auto* obj = new (mem) V8NPObject();
+    return &obj->object;
 }
 
 void freeV8NPObject(NPObject* npObject)
@@ -111,13 +135,16 @@ void syncSwfUploadCookiesToWinInet(V8NPObject* v8NpObject)
     if (!docUrl.ProtocolIsInHTTPFamily())
         return;
 
-    std::string cookie = cookieJar->getCookiesForSession(docUrl, true);
+    std::string cookie = cookieJar->getCookiesForSession(docUrl, false);
     if (cookie.size() < 3)
         return;
     if (cookie.back() != ';')
         cookie += "; ";
 
     std::string host = docUrl.Protocol().Utf8() + "://" + docUrl.Host().Utf8();
+    if (docUrl.HasPort())
+        host += ":" + std::to_string(docUrl.Port());
+
     size_t pos = 0;
     while (pos < cookie.size()) {
         while (pos < cookie.size() && cookie[pos] == ' ')
@@ -133,9 +160,13 @@ void syncSwfUploadCookiesToWinInet(V8NPObject* v8NpObject)
         std::string val = cookie.substr(eq + 1, semi - eq - 1);
         pos = semi + 1;
 
-        std::string clearLine = key + "=null;path=/;expires=Thu, 01-Jan-1970 00:00:01 GMT";
-        ::InternetSetCookieA(host.c_str(), nullptr, clearLine.c_str());
-        std::string setLine = val + ";path=/;expires=Thu, 01-Jan-2035 00:00:01 GMT";
+        if (key.empty() || key.find_first_of(";\r\n") != std::string::npos
+            || val.find_first_of(";\r\n") != std::string::npos) {
+            continue;
+        }
+
+        // Write as session-scoped cookie (no permanent expires) to avoid persisting credentials in IE cache.
+        std::string setLine = val + ";path=/";
         ::InternetSetCookieA(host.c_str(), key.c_str(), setLine.c_str());
     }
 }
@@ -177,17 +208,21 @@ void convertV8ObjectToNPVariant(
     } else if (object->IsString()) {
         v8::Local<v8::String> str = object.As<v8::String>();
         int utf8Len = str->Utf8Length(isolate);
-        char* utf8Chars = static_cast<char*>(malloc(utf8Len + 1));
+        char* utf8Chars = static_cast<char*>(NPN_MemAlloc(static_cast<uint32_t>(utf8Len + 1)));
+        if (!utf8Chars)
+            return;
         str->WriteUtf8(isolate, utf8Chars, utf8Len + 1);
         STRINGN_TO_NPVARIANT(utf8Chars, static_cast<uint32_t>(utf8Len), *result);
     } else if (object->IsObject()) {
         blink::WebLocalFrame* rootFrame = nullptr;
+        NPP ownerInstance = nullptr;
         int64_t mbwebviewId = 0;
         if (V8NPObject* ownerV8 = npObjectToV8NPObject(owner)) {
             rootFrame = ownerV8->rootFrame;
+            ownerInstance = ownerV8->ownerInstance;
             mbwebviewId = ownerV8->mbwebviewId;
         }
-        NPObject* npobject = npCreateV8ScriptObject(isolate, context, nullptr, object.As<v8::Object>(), rootFrame, mbwebviewId);
+        NPObject* npobject = npCreateV8ScriptObject(isolate, context, ownerInstance, object.As<v8::Object>(), rootFrame, mbwebviewId);
         if (npobject)
             _NPN_RegisterObject(npobject, owner);
         OBJECT_TO_NPVARIANT(npobject, *result);
@@ -263,6 +298,7 @@ void disposeV8NPObject(NPObject* npObject)
     v8NpObject->v8Object.Reset();
     v8NpObject->v8Context.Reset();
     v8NpObject->rootFrame = nullptr;
+    v8NpObject->ownerInstance = nullptr;
 }
 
 NPObject* npCreateV8ScriptObject(
@@ -285,7 +321,9 @@ NPObject* npCreateV8ScriptObject(
         if (it != hashMap.end()) {
             for (V8NPObject* existing : it->second) {
                 if (existing && !existing->v8Object.IsEmpty()
+                    && existing->ownerInstance == npp
                     && existing->rootFrame == rootFrame
+                    && (context.IsEmpty() || existing->v8Context.IsEmpty() || existing->v8Context.Get(isolate) == context)
                     && existing->v8Object.Get(isolate) == object) {
                     _NPN_RetainObject(&existing->object);
                     return reinterpret_cast<NPObject*>(existing);
@@ -298,12 +336,11 @@ NPObject* npCreateV8ScriptObject(
     if (!v8npObject)
         return nullptr;
 
-    new (&v8npObject->v8Object) v8::Global<v8::Object>();
-    new (&v8npObject->v8Context) v8::Global<v8::Context>();
     v8npObject->v8Object.Reset(isolate, object);
     if (!context.IsEmpty())
         v8npObject->v8Context.Reset(isolate, context);
     v8npObject->rootFrame = rootFrame;
+    v8npObject->ownerInstance = npp;
     v8npObject->mbwebviewId = mbwebviewId;
     v8npObject->identityHash = hash;
     if (hash != 0)
@@ -322,11 +359,12 @@ bool _NPN_Invoke(NPP npp, NPObject* npObject, NPIdentifier methodName, const NPV
     if (result)
         VOID_TO_NPVARIANT(*result);
 
+    content::ScopedNPObjectRetain retain(npObject);
     content::V8NPObject* v8NpObject = content::npObjectToV8NPObject(npObject);
     if (!v8NpObject) {
         if (npObject->_class && npObject->_class->invoke)
             return npObject->_class->invoke(npObject, methodName, arguments, argumentCount, result);
-        return true;
+        return false;
     }
 
     auto* identifier = static_cast<content::PrivateIdentifier*>(methodName);
@@ -348,6 +386,7 @@ bool _NPN_Invoke(NPP npp, NPObject* npObject, NPIdentifier methodName, const NPV
         return false;
 
     v8::Context::Scope contextScope(context);
+    v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
     v8::TryCatch tryCatch(isolate);
 
     v8::Local<v8::Object> recv = v8NpObject->v8Object.Get(isolate);
@@ -360,7 +399,7 @@ bool _NPN_Invoke(NPP npp, NPObject* npObject, NPIdentifier methodName, const NPV
     if (!fnVal.As<v8::Function>()->Call(context, recv, argumentCount, argv.get()).ToLocal(&retVal))
         return false;
 
-    if (result)
+    if (_NPN_IsAlive(npObject) && result)
         content::convertV8ObjectToNPVariant(isolate, context, retVal, npObject, result);
     return true;
 }
@@ -372,11 +411,12 @@ bool _NPN_InvokeDefault(NPP, NPObject* npObject, const NPVariant* arguments, uin
     if (result)
         VOID_TO_NPVARIANT(*result);
 
+    content::ScopedNPObjectRetain retain(npObject);
     content::V8NPObject* v8NpObject = content::npObjectToV8NPObject(npObject);
     if (!v8NpObject) {
         if (npObject->_class && npObject->_class->invokeDefault)
             return npObject->_class->invokeDefault(npObject, arguments, argumentCount, result);
-        return true;
+        return false;
     }
 
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
@@ -388,6 +428,7 @@ bool _NPN_InvokeDefault(NPP, NPObject* npObject, const NPVariant* arguments, uin
         return false;
 
     v8::Context::Scope contextScope(context);
+    v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
     v8::TryCatch tryCatch(isolate);
 
     v8::Local<v8::Object> fnObj = v8NpObject->v8Object.Get(isolate);
@@ -399,7 +440,7 @@ bool _NPN_InvokeDefault(NPP, NPObject* npObject, const NPVariant* arguments, uin
     if (!fnObj.As<v8::Function>()->Call(context, context->Global(), argumentCount, argv.get()).ToLocal(&retVal))
         return false;
 
-    if (result)
+    if (_NPN_IsAlive(npObject) && result)
         content::convertV8ObjectToNPVariant(isolate, context, retVal, npObject, result);
     return true;
 }
@@ -409,13 +450,14 @@ bool _NPN_Evaluate(NPP npp, NPObject* npObject, NPString* npScript, NPVariant* r
     return _NPN_EvaluateHelper(npp, false, npObject, npScript, result);
 }
 
-bool _NPN_EvaluateHelper(NPP, bool, NPObject* npObject, NPString* npScript, NPVariant* result)
+bool _NPN_EvaluateHelper(NPP, bool popupsAllowed, NPObject* npObject, NPString* npScript, NPVariant* result)
 {
     if (result)
         VOID_TO_NPVARIANT(*result);
     if (blink::ScriptForbiddenScope::IsScriptForbidden() || !npObject || !npScript)
         return false;
 
+    content::ScopedNPObjectRetain retain(npObject);
     content::V8NPObject* v8NpObject = content::npObjectToV8NPObject(npObject);
     if (!v8NpObject)
         return false;
@@ -428,10 +470,16 @@ bool _NPN_EvaluateHelper(NPP, bool, NPObject* npObject, NPString* npScript, NPVa
     if (!content::enterV8NPObjectContext(v8NpObject, isolate, &context))
         return false;
 
+    if (popupsAllowed && v8NpObject->rootFrame)
+        v8NpObject->rootFrame->NotifyUserActivation(blink::mojom::UserActivationNotificationType::kInteraction);
+
     v8::Context::Scope contextScope(context);
+    v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
     v8::TryCatch tryCatch(isolate);
 
-    std::string scriptStd(npScript->UTF8Characters ? npScript->UTF8Characters : "", npScript->UTF8Length);
+    std::string scriptStd;
+    if (npScript->UTF8Characters && npScript->UTF8Length > 0)
+        scriptStd.assign(npScript->UTF8Characters, npScript->UTF8Length);
 #if defined(_WIN32)
     if (scriptStd.find("SWFUpload") != std::string::npos && scriptStd.find("uploadStart(") != std::string::npos)
         content::syncSwfUploadCookiesToWinInet(v8NpObject);
@@ -460,6 +508,7 @@ bool _NPN_GetProperty(NPP, NPObject* npObject, NPIdentifier propertyName, NPVari
         return false;
     VOID_TO_NPVARIANT(*result);
 
+    content::ScopedNPObjectRetain retain(npObject);
     if (content::V8NPObject* object = content::npObjectToV8NPObject(npObject)) {
         v8::Isolate* isolate = v8::Isolate::GetCurrent();
         if (!isolate)
@@ -470,6 +519,7 @@ bool _NPN_GetProperty(NPP, NPObject* npObject, NPIdentifier propertyName, NPVari
             return false;
 
         v8::Context::Scope contextScope(context);
+        v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
         v8::TryCatch tryCatch(isolate);
 
         v8::Local<v8::Object> obj = object->v8Object.Get(isolate);
@@ -477,7 +527,8 @@ bool _NPN_GetProperty(NPP, NPObject* npObject, NPIdentifier propertyName, NPVari
         if (!obj->Get(context, content::npIdentifierToV8String(isolate, propertyName)).ToLocal(&v8result))
             return false;
 
-        content::convertV8ObjectToNPVariant(isolate, context, v8result, npObject, result);
+        if (_NPN_IsAlive(npObject))
+            content::convertV8ObjectToNPVariant(isolate, context, v8result, npObject, result);
         return true;
     }
 
@@ -493,6 +544,7 @@ bool _NPN_SetProperty(NPP, NPObject* npObject, NPIdentifier propertyName, const 
     if (!npObject || !value)
         return false;
 
+    content::ScopedNPObjectRetain retain(npObject);
     if (content::V8NPObject* object = content::npObjectToV8NPObject(npObject)) {
         v8::Isolate* isolate = v8::Isolate::GetCurrent();
         if (!isolate)
@@ -503,6 +555,7 @@ bool _NPN_SetProperty(NPP, NPObject* npObject, NPIdentifier propertyName, const 
             return false;
 
         v8::Context::Scope contextScope(context);
+        v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
         v8::TryCatch tryCatch(isolate);
 
         v8::Local<v8::Object> obj = object->v8Object.Get(isolate);
@@ -612,6 +665,7 @@ bool _NPN_Enumerate(NPP, NPObject* npObject, NPIdentifier** identifier, uint32_t
     if (!npObject || !identifier || !count)
         return false;
 
+    content::ScopedNPObjectRetain retain(npObject);
     if (content::V8NPObject* object = content::npObjectToV8NPObject(npObject)) {
         v8::Isolate* isolate = v8::Isolate::GetCurrent();
         if (!isolate)
@@ -629,9 +683,13 @@ bool _NPN_Enumerate(NPP, NPObject* npObject, NPIdentifier** identifier, uint32_t
         if (!obj->GetPropertyNames(context).ToLocal(&props))
             return false;
 
-        *count = props->Length();
-        *identifier = static_cast<NPIdentifier*>(NPN_MemAlloc(sizeof(NPIdentifier) * (*count > 0 ? *count : 1)));
-        for (uint32_t i = 0; i < *count; ++i) {
+        uint32_t propCount = props->Length();
+        NPIdentifier* outIds = static_cast<NPIdentifier*>(NPN_MemAlloc(sizeof(NPIdentifier) * (propCount > 0 ? propCount : 1)));
+        if (!outIds)
+            return false;
+        *count = propCount;
+        *identifier = outIds;
+        for (uint32_t i = 0; i < propCount; ++i) {
             v8::Local<v8::Value> nameVal;
             v8::Local<v8::String> nameStr;
             if (!props->Get(context, i).ToLocal(&nameVal) || !nameVal->ToString(context).ToLocal(&nameStr)) {
@@ -655,6 +713,7 @@ bool _NPN_Construct(NPP, NPObject* npObject, const NPVariant* arguments, uint32_
     if (result)
         VOID_TO_NPVARIANT(*result);
 
+    content::ScopedNPObjectRetain retain(npObject);
     if (content::V8NPObject* object = content::npObjectToV8NPObject(npObject)) {
         v8::Isolate* isolate = v8::Isolate::GetCurrent();
         if (!isolate)
@@ -665,6 +724,7 @@ bool _NPN_Construct(NPP, NPObject* npObject, const NPVariant* arguments, uint32_
             return false;
 
         v8::Context::Scope contextScope(context);
+        v8::MicrotasksScope microtasksScope(context, v8::MicrotasksScope::Type::kRunMicrotasks);
         v8::TryCatch tryCatch(isolate);
 
         v8::Local<v8::Object> ctorObj = object->v8Object.Get(isolate);
@@ -676,7 +736,7 @@ bool _NPN_Construct(NPP, NPObject* npObject, const NPVariant* arguments, uint32_
         if (!ctorObj.As<v8::Function>()->CallAsConstructor(context, argumentCount, argv.get()).ToLocal(&retObj))
             return false;
 
-        if (result)
+        if (_NPN_IsAlive(npObject) && result)
             content::convertV8ObjectToNPVariant(isolate, context, retObj, npObject, result);
         return true;
     }

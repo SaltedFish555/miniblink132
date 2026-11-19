@@ -31,6 +31,14 @@ CRITICAL_SECTION* getWebPluginImeLock()
     return &s_lock.cs;
 }
 
+class ScopedImeCsLock {
+public:
+    ScopedImeCsLock() { ::EnterCriticalSection(getWebPluginImeLock()); }
+    ~ScopedImeCsLock() { ::LeaveCriticalSection(getWebPluginImeLock()); }
+    ScopedImeCsLock(const ScopedImeCsLock&) = delete;
+    ScopedImeCsLock& operator=(const ScopedImeCsLock&) = delete;
+};
+
 DWORD WINAPI immGetPropertyStub(HKL, DWORD)
 {
     return 0xd000a;
@@ -170,14 +178,9 @@ void WebPluginIMEWin::compositionCompleted(const std::u16string& text)
     npEvent.lParam = 0;
     m_events.push_back(npEvent);
 
-    if (!m_supportImeMessages) {
-        npEvent.event = WM_CHAR;
-        npEvent.lParam = 0;
-        for (char16_t ch : m_resultText) {
-            npEvent.wParam = ch;
-            m_events.push_back(npEvent);
-        }
-    }
+    // Defer WM_CHAR fallback until after WM_IME_COMPOSITION has been delivered
+    // in sendEvents() so m_supportImeMessages is accurately detected on the first commit.
+    m_hasPendingFallbackResult = true;
 #endif
 }
 
@@ -195,6 +198,22 @@ bool WebPluginIMEWin::sendEvents(NPP instance, NPP_HandleEventProcPtr eventPtr)
         if (!eventPtr(instance, &ev))
             ret = false;
     }
+
+#if defined(_WIN32)
+    if (m_hasPendingFallbackResult) {
+        m_hasPendingFallbackResult = false;
+        if (!m_supportImeMessages && !m_resultText.empty()) {
+            NPEvent charEvent {};
+            charEvent.event = WM_CHAR;
+            charEvent.lParam = 0;
+            for (char16_t ch : m_resultText) {
+                charEvent.wParam = ch;
+                if (!eventPtr(instance, &charEvent))
+                    ret = false;
+            }
+        }
+    }
+#endif
     return ret;
 }
 
@@ -315,52 +334,65 @@ WebPluginIMEWin* WebPluginIMEWin::getInstance(HIMC context)
 
 BOOL WINAPI WebPluginIMEWin::immAssociateContextEx(HWND window, HIMC context, DWORD flags)
 {
-    WebPluginIMEWin* instance = s_instance;
-    if (!instance || (context && context != reinterpret_cast<HIMC>(instance)))
-        return ::ImmAssociateContextEx(window, context, flags);
-
-    instance->m_inputType = (!context && !flags) ? 0 : 1;
-    instance->m_statusUpdated = true;
-    return TRUE;
+    {
+        ScopedImeCsLock csLock;
+        WebPluginIMEWin* instance = s_instance;
+        if (instance && (!context || context == reinterpret_cast<HIMC>(instance))) {
+            instance->m_inputType = (!context && !flags) ? 0 : 1;
+            instance->m_statusUpdated = true;
+            return TRUE;
+        }
+    }
+    return ::ImmAssociateContextEx(window, context, flags);
 }
 
 LONG WINAPI WebPluginIMEWin::immGetCompositionStringW(HIMC context, DWORD index, LPVOID dstData, DWORD dstSize)
 {
-    WebPluginIMEWin* instance = getInstance(context);
-    if (!instance)
-        return ::ImmGetCompositionStringW(context, index, dstData, dstSize);
+    {
+        ScopedImeCsLock csLock;
+        WebPluginIMEWin* instance = getInstance(context);
+        if (instance) {
+            const void* srcData = nullptr;
+            DWORD srcSize = 0;
+            switch (index) {
+            case GCS_COMPSTR:
+                srcData = instance->m_compositionText.data();
+                srcSize = static_cast<DWORD>(instance->m_compositionText.size() * sizeof(char16_t));
+                break;
+            case GCS_COMPATTR:
+                srcData = instance->m_compositionAttributes.data();
+                srcSize = static_cast<DWORD>(instance->m_compositionAttributes.size());
+                break;
+            case GCS_COMPCLAUSE:
+                srcData = instance->m_compositionClauses.data();
+                srcSize = static_cast<DWORD>(instance->m_compositionClauses.size() * sizeof(uint32_t));
+                break;
+            case GCS_CURSORPOS:
+                return instance->m_cursorPosition;
+            case GCS_DELTASTART:
+                return instance->m_deltaStart;
+            case GCS_RESULTSTR:
+                srcData = instance->m_resultText.data();
+                srcSize = static_cast<DWORD>(instance->m_resultText.size() * sizeof(char16_t));
+                break;
+            case GCS_RESULTCLAUSE:
+                srcData = &instance->m_resultClauses[0];
+                srcSize = sizeof(instance->m_resultClauses);
+                break;
+            default:
+                return IMM_ERROR_NODATA;
+            }
 
-    const void* srcData = nullptr;
-    DWORD srcSize = 0;
-    switch (index) {
-    case GCS_COMPSTR:
-        srcData = instance->m_compositionText.data();
-        srcSize = static_cast<DWORD>(instance->m_compositionText.size() * sizeof(char16_t));
-        break;
-    case GCS_COMPATTR:
-    case GCS_COMPCLAUSE:
-        return 0;
-    case GCS_CURSORPOS:
-        return instance->m_cursorPosition;
-    case GCS_DELTASTART:
-        return instance->m_deltaStart;
-    case GCS_RESULTSTR:
-        srcData = instance->m_resultText.data();
-        srcSize = static_cast<DWORD>(instance->m_resultText.size() * sizeof(char16_t));
-        break;
-    case GCS_RESULTCLAUSE:
-        srcData = &instance->m_resultClauses[0];
-        srcSize = sizeof(instance->m_resultClauses);
-        break;
-    default:
-        break;
+            if (!srcData || srcSize == 0)
+                return 0;
+            if (!dstData || dstSize == 0)
+                return static_cast<LONG>(srcSize);
+            DWORD copySize = std::min(dstSize, srcSize);
+            memcpy(dstData, srcData, copySize);
+            return static_cast<LONG>(copySize);
+        }
     }
-
-    if (!srcData || !srcSize)
-        return IMM_ERROR_NODATA;
-    if (dstData && dstSize >= srcSize)
-        memcpy(dstData, srcData, srcSize);
-    return static_cast<LONG>(srcSize);
+    return ::ImmGetCompositionStringW(context, index, dstData, dstSize);
 }
 
 HIMC WINAPI WebPluginIMEWin::immGetContext(HWND window)
@@ -372,47 +404,63 @@ HIMC WINAPI WebPluginIMEWin::immGetContext(HWND window)
             return ::ImmGetContext(window);
     }
 
-    if (s_instance)
-        s_instance->m_supportImeMessages = true;
-    return reinterpret_cast<HIMC>(s_instance);
+    {
+        ScopedImeCsLock csLock;
+        if (s_instance) {
+            s_instance->m_supportImeMessages = true;
+            return reinterpret_cast<HIMC>(s_instance);
+        }
+    }
+    return ::ImmGetContext(window);
 }
 
 BOOL WINAPI WebPluginIMEWin::immReleaseContext(HWND window, HIMC context)
 {
-    if (!getInstance(context))
-        return ::ImmReleaseContext(window, context);
-    return TRUE;
+    {
+        ScopedImeCsLock csLock;
+        if (getInstance(context))
+            return TRUE;
+    }
+    return ::ImmReleaseContext(window, context);
 }
 
 BOOL WINAPI WebPluginIMEWin::immSetCandidateWindow(HIMC context, CANDIDATEFORM* candidate)
 {
-    WebPluginIMEWin* instance = getInstance(context);
-    if (!instance)
-        return ::ImmSetCandidateWindow(context, candidate);
-
-    if (candidate) {
-        gfx::Rect rect(candidate->rcArea.left, candidate->rcArea.top,
-            candidate->rcArea.right - candidate->rcArea.left, candidate->rcArea.bottom - candidate->rcArea.top);
-        if (instance->m_caretRect != rect) {
-            instance->m_caretRect = rect;
-            instance->m_statusUpdated = true;
+    {
+        ScopedImeCsLock csLock;
+        WebPluginIMEWin* instance = getInstance(context);
+        if (instance) {
+            if (candidate) {
+                gfx::Rect rect(candidate->rcArea.left, candidate->rcArea.top,
+                    candidate->rcArea.right - candidate->rcArea.left, candidate->rcArea.bottom - candidate->rcArea.top);
+                if (rect.IsEmpty())
+                    rect = gfx::Rect(candidate->ptCurrentPos.x, candidate->ptCurrentPos.y, 1, 1);
+                if (instance->m_caretRect != rect) {
+                    instance->m_caretRect = rect;
+                    instance->m_statusUpdated = true;
+                }
+            }
+            return TRUE;
         }
     }
-    return TRUE;
+    return ::ImmSetCandidateWindow(context, candidate);
 }
 
 BOOL WINAPI WebPluginIMEWin::immSetOpenStatus(HIMC context, BOOL open)
 {
-    WebPluginIMEWin* instance = getInstance(context);
-    if (!instance)
-        return ::ImmSetOpenStatus(context, open);
-
-    int inputType = open ? 1 : 0;
-    if (instance->m_inputType != inputType) {
-        instance->m_inputType = inputType;
-        instance->m_statusUpdated = true;
+    {
+        ScopedImeCsLock csLock;
+        WebPluginIMEWin* instance = getInstance(context);
+        if (instance) {
+            int inputType = open ? 1 : 0;
+            if (instance->m_inputType != inputType) {
+                instance->m_inputType = inputType;
+                instance->m_statusUpdated = true;
+            }
+            return TRUE;
+        }
     }
-    return TRUE;
+    return ::ImmSetOpenStatus(context, open);
 }
 #endif // defined(_WIN32)
 

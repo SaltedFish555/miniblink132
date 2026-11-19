@@ -67,6 +67,7 @@ struct V8NPObject {
     v8::Global<v8::Object> v8Object;
     v8::Global<v8::Context> v8Context;
     blink::WebLocalFrame* rootFrame = nullptr;
+    NPP ownerInstance = nullptr;
     int64_t mbwebviewId = 0;
     int identityHash = 0;
 };
