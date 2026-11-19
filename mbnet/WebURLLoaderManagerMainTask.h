@@ -678,7 +678,7 @@ static bool isDownloadResponse(WebURLLoaderInternal* job, const AtomicString& co
     if (contentType.empty() || contentType.IsNull())
         return false;
 
-    String contentMime = blink::ExtractMIMETypeFromMediaType(contentType.GetString()).LowerASCII();
+    String contentMime = blink::ExtractMIMETypeFromMediaType(contentType).LowerASCII();
     if (contentMime.empty())
         contentMime = contentType.LowerASCII();
 
