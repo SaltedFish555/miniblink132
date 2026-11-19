@@ -683,18 +683,23 @@ void MB_CALL_TYPE mbSetDragEnable(mbWebView webviewHandle, BOOL b)
 
 void MB_CALL_TYPE mbSetHandleOffset(mbWebView webviewHandle, int x, int y)
 {
-    content::MbWebView* webview = (content::MbWebView*)common::LiveIdDetect::getMbWebviewIds()->getPtr((int64_t)webviewHandle);
-    if (!webview)
+    if (!webviewHandle)
         return;
-    webview->setOffset(x, y);
+    content::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [x, y](content::MbWebView* webview) {
+        webview->setOffset(x, y);
+    });
 }
 
 void MB_CALL_TYPE mbSetNpapiPluginsEnabled(mbWebView webviewHandle, BOOL b)
 {
     bool enabled = !!b;
     content::setNpapiPluginsEnabled(enabled);
-    if (!webviewHandle)
+    if (!webviewHandle) {
+        content::ThreadCall::callBlinkThreadAsync(MB_FROM_HERE, []() {
+            blink::PluginData::RefreshBrowserSidePluginCache();
+        });
         return;
+    }
     content::ThreadCall::callBlinkThreadAsyncWithValid(MB_FROM_HERE, webviewHandle, [enabled](content::MbWebView* self) {
         blink::WebViewImpl* webView = static_cast<blink::WebViewImpl*>(self->getWebView());
         if (webView) {

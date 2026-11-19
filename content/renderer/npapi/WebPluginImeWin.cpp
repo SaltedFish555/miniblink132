@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 #include "base/strings/string_util.h"
 
@@ -18,7 +19,17 @@ WebPluginIMEWin* WebPluginIMEWin::s_instance = nullptr;
 
 namespace {
 #if defined(_WIN32)
-CRITICAL_SECTION* g_webPluginImeLock = nullptr;
+struct ImeCriticalSection {
+    CRITICAL_SECTION cs;
+    ImeCriticalSection() { ::InitializeCriticalSection(&cs); }
+    ~ImeCriticalSection() { ::DeleteCriticalSection(&cs); }
+};
+
+CRITICAL_SECTION* getWebPluginImeLock()
+{
+    static ImeCriticalSection s_lock;
+    return &s_lock.cs;
+}
 
 DWORD WINAPI immGetPropertyStub(HKL, DWORD)
 {
@@ -30,14 +41,15 @@ BOOL WINAPI immIsIMEStub(HKL)
     return FALSE;
 }
 
-bool importAddressTableHook(HMODULE hModule, LPCSTR targetImageName, LPCVOID targetFuncAddr, LPCVOID replaceFuncAddr)
+bool patchSingleIatEntry(HMODULE hModule, const char* const* targetDllNames, size_t targetDllCount,
+    LPCSTR targetFuncName, LPCVOID targetFuncAddr, LPCVOID replaceFuncAddr)
 {
-    if (!hModule)
+    if (!hModule || !replaceFuncAddr)
         return false;
 
     auto* baseAddr = reinterpret_cast<BYTE*>(hModule);
     auto* dosHdr = reinterpret_cast<IMAGE_DOS_HEADER*>(baseAddr);
-    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE)
+    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE || dosHdr->e_lfanew <= 0)
         return false;
 
     auto* ntHdr = reinterpret_cast<IMAGE_NT_HEADERS*>(baseAddr + dosHdr->e_lfanew);
@@ -49,33 +61,55 @@ bool importAddressTableHook(HMODULE hModule, LPCSTR targetImageName, LPCVOID tar
         return false;
 
     auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(baseAddr + importRva);
-    IMAGE_THUNK_DATA* thunkData = nullptr;
+    bool patchedAny = false;
 
-    while (importDesc->Characteristics != 0) {
+    while (importDesc->Name != 0 && importDesc->FirstThunk != 0) {
         const char* dllName = reinterpret_cast<const char*>(baseAddr + importDesc->Name);
-        if (base::EqualsCaseInsensitiveASCII(dllName, targetImageName)) {
-            thunkData = reinterpret_cast<IMAGE_THUNK_DATA*>(baseAddr + importDesc->FirstThunk);
-            break;
+        bool dllMatched = false;
+        for (size_t i = 0; i < targetDllCount; ++i) {
+            if (base::EqualsCaseInsensitiveASCII(dllName, targetDllNames[i])) {
+                dllMatched = true;
+                break;
+            }
+        }
+        if (dllMatched) {
+            auto* thunkData = reinterpret_cast<IMAGE_THUNK_DATA*>(baseAddr + importDesc->FirstThunk);
+            IMAGE_THUNK_DATA* origThunk = importDesc->OriginalFirstThunk
+                ? reinterpret_cast<IMAGE_THUNK_DATA*>(baseAddr + importDesc->OriginalFirstThunk)
+                : nullptr;
+
+            while (thunkData->u1.Function) {
+                auto* funcSlot = reinterpret_cast<ULONG_PTR*>(&thunkData->u1.Function);
+                if (*funcSlot == reinterpret_cast<ULONG_PTR>(replaceFuncAddr)) {
+                    patchedAny = true;
+                } else {
+                    bool matched = false;
+                    if (origThunk && targetFuncName && !IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) {
+                        const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                            baseAddr + origThunk->u1.AddressOfData);
+                        if (strcmp(reinterpret_cast<const char*>(importByName->Name), targetFuncName) == 0)
+                            matched = true;
+                    }
+                    if (!matched && targetFuncAddr && *funcSlot == reinterpret_cast<ULONG_PTR>(targetFuncAddr))
+                        matched = true;
+
+                    if (matched) {
+                        DWORD oldProtect = 0;
+                        if (::VirtualProtect(funcSlot, sizeof(ULONG_PTR), PAGE_READWRITE, &oldProtect)) {
+                            *funcSlot = reinterpret_cast<ULONG_PTR>(replaceFuncAddr);
+                            ::VirtualProtect(funcSlot, sizeof(ULONG_PTR), oldProtect, &oldProtect);
+                            patchedAny = true;
+                        }
+                    }
+                }
+                ++thunkData;
+                if (origThunk)
+                    ++origThunk;
+            }
         }
         ++importDesc;
     }
-
-    if (!thunkData)
-        return false;
-
-    while (thunkData->u1.Function) {
-        auto* funcSlot = reinterpret_cast<ULONG_PTR*>(&thunkData->u1.Function);
-        if (*funcSlot == reinterpret_cast<ULONG_PTR>(targetFuncAddr)) {
-            DWORD oldProtect = 0;
-            if (!::VirtualProtect(funcSlot, sizeof(ULONG_PTR), PAGE_READWRITE, &oldProtect))
-                return false;
-            *funcSlot = reinterpret_cast<ULONG_PTR>(replaceFuncAddr);
-            ::VirtualProtect(funcSlot, sizeof(ULONG_PTR), oldProtect, &oldProtect);
-            return true;
-        }
-        ++thunkData;
-    }
-    return false;
+    return patchedAny;
 }
 #endif
 } // namespace
@@ -152,13 +186,15 @@ bool WebPluginIMEWin::sendEvents(NPP instance, NPP_HandleEventProcPtr eventPtr)
     if (!eventPtr)
         return false;
 
+    std::vector<NPEvent> pendingEvents;
+    pendingEvents.swap(m_events);
+
     ScopedLock lock(this);
     bool ret = true;
-    for (auto& ev : m_events) {
+    for (auto& ev : pendingEvents) {
         if (!eventPtr(instance, &ev))
             ret = false;
     }
-    m_events.clear();
     return ret;
 }
 
@@ -169,37 +205,70 @@ bool WebPluginIMEWin::getStatus(int* inputType, gfx::Rect* caretRect) const
     return true;
 }
 
-void WebPluginIMEWin::lock()
+WebPluginIMEWin* WebPluginIMEWin::lock()
 {
 #if defined(_WIN32)
-    if (!g_webPluginImeLock) {
-        g_webPluginImeLock = new CRITICAL_SECTION();
-        ::InitializeCriticalSection(g_webPluginImeLock);
-    }
-    ::EnterCriticalSection(g_webPluginImeLock);
+    ::EnterCriticalSection(getWebPluginImeLock());
 #endif
+    WebPluginIMEWin* previous = s_instance;
     s_instance = this;
+    return previous;
 }
 
-void WebPluginIMEWin::unlock()
+void WebPluginIMEWin::unlock(WebPluginIMEWin* previousInstance)
 {
-    s_instance = nullptr;
+    s_instance = previousInstance;
 #if defined(_WIN32)
-    ::LeaveCriticalSection(g_webPluginImeLock);
+    ::LeaveCriticalSection(getWebPluginImeLock());
 #endif
 }
 
 bool WebPluginIMEWin::hookGetProcAddress(HMODULE module)
 {
 #if defined(_WIN32)
-    HMODULE kernel32 = ::GetModuleHandleA("kernel32.dll");
-    if (!kernel32)
+    if (!module)
         return false;
-    FARPROC origGetProcAddress = ::GetProcAddress(kernel32, "GetProcAddress");
-    if (!origGetProcAddress)
-        return false;
-    return importAddressTableHook(
-        module, "kernel32.dll", reinterpret_cast<LPCVOID>(origGetProcAddress), reinterpret_cast<LPCVOID>(&WebPluginIMEWin::GetProcAddressPatch));
+
+    bool patched = false;
+
+    static const char* const kLoaderDlls[] = {
+        "kernel32.dll",
+        "kernelbase.dll",
+        "api-ms-win-core-libraryloader-l1-2-0.dll",
+        "api-ms-win-core-libraryloader-l1-1-0.dll",
+    };
+    FARPROC origGetProcAddress = nullptr;
+    if (HMODULE kernel32 = ::GetModuleHandleA("kernel32.dll"))
+        origGetProcAddress = ::GetProcAddress(kernel32, "GetProcAddress");
+    if (patchSingleIatEntry(module, kLoaderDlls, std::size(kLoaderDlls), "GetProcAddress",
+            reinterpret_cast<LPCVOID>(origGetProcAddress), reinterpret_cast<LPCVOID>(&WebPluginIMEWin::GetProcAddressPatch))) {
+        patched = true;
+    }
+
+    // Also patch direct imm32.dll IAT entries (used by 64-bit NPSWF64.dll builds).
+    static const char* const kImmDlls[] = { "imm32.dll" };
+    static const struct {
+        const char* name;
+        FARPROC replacement;
+    } kDirectImmHooks[] = {
+        { "ImmAssociateContextEx", reinterpret_cast<FARPROC>(&immAssociateContextEx) },
+        { "ImmGetCompositionStringW", reinterpret_cast<FARPROC>(&immGetCompositionStringW) },
+        { "ImmGetContext", reinterpret_cast<FARPROC>(&immGetContext) },
+        { "ImmReleaseContext", reinterpret_cast<FARPROC>(&immReleaseContext) },
+        { "ImmSetCandidateWindow", reinterpret_cast<FARPROC>(&immSetCandidateWindow) },
+        { "ImmSetOpenStatus", reinterpret_cast<FARPROC>(&immSetOpenStatus) },
+        { "ImmIsIME", reinterpret_cast<FARPROC>(&immIsIMEStub) },
+        { "ImmGetProperty", reinterpret_cast<FARPROC>(&immGetPropertyStub) },
+    };
+    HMODULE imm32 = ::GetModuleHandleA("imm32.dll");
+    for (const auto& entry : kDirectImmHooks) {
+        FARPROC origImmFn = imm32 ? ::GetProcAddress(imm32, entry.name) : nullptr;
+        if (patchSingleIatEntry(module, kImmDlls, std::size(kImmDlls), entry.name,
+                reinterpret_cast<LPCVOID>(origImmFn), reinterpret_cast<LPCVOID>(entry.replacement))) {
+            patched = true;
+        }
+    }
+    return patched;
 #else
     return false;
 #endif
@@ -246,11 +315,11 @@ WebPluginIMEWin* WebPluginIMEWin::getInstance(HIMC context)
 
 BOOL WINAPI WebPluginIMEWin::immAssociateContextEx(HWND window, HIMC context, DWORD flags)
 {
-    WebPluginIMEWin* instance = getInstance(context);
-    if (!instance)
+    WebPluginIMEWin* instance = s_instance;
+    if (!instance || (context && context != reinterpret_cast<HIMC>(instance)))
         return ::ImmAssociateContextEx(window, context, flags);
 
-    instance->m_inputType = (!context && !flags) ? 1 : 0;
+    instance->m_inputType = (!context && !flags) ? 0 : 1;
     instance->m_statusUpdated = true;
     return TRUE;
 }

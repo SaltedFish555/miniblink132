@@ -129,6 +129,7 @@ bool WebPluginImpl::handleKeyboardCharEventForEmulateIme(int windowsKeyCode)
 #if defined(_WIN32)
     if (!m_plugin || !m_instance)
         return false;
+    scoped_refptr<WebPluginImpl> protect(this);
     if (!m_pluginIme && m_plugin->quirks().contains(PluginQuirkEmulateIme))
         m_pluginIme = std::make_unique<WebPluginIMEWin>();
     if (!m_pluginIme)
@@ -254,6 +255,7 @@ bool WebPluginImpl::SetComposition(const blink::WebString& text, const blink::We
 {
     if (!m_plugin || !m_instance)
         return false;
+    scoped_refptr<WebPluginImpl> protect(this);
     if (!m_pluginIme && m_plugin->quirks().contains(PluginQuirkEmulateIme))
         m_pluginIme = std::make_unique<WebPluginIMEWin>();
     if (!m_pluginIme)
@@ -280,6 +282,7 @@ bool WebPluginImpl::CommitText(const blink::WebString& text, const blink::WebVec
 {
     if (!m_plugin || !m_instance)
         return false;
+    scoped_refptr<WebPluginImpl> protect(this);
     if (!m_pluginIme && m_plugin->quirks().contains(PluginQuirkEmulateIme))
         m_pluginIme = std::make_unique<WebPluginIMEWin>();
     if (!m_pluginIme)

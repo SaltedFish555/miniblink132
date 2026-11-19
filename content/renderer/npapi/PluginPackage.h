@@ -51,7 +51,7 @@ public:
     const WTF::String& fileName() const { return m_fileName; }
     const WTF::String& parentDirectory() const { return m_parentDirectory; }
     PlatformModule module() const { return m_module; }
-    uint16_t NPVersion() const { return NP_VERSION_MINOR; }
+    uint16_t NPVersion() const { return NPVERS_HAS_PRIVATE_MODE; }
     time_t lastModified() const { return m_lastModified; }
 
     const MIMEToDescriptionsMap& mimeToDescriptions() const { return m_mimeToDescriptions; }

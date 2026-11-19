@@ -23,6 +23,7 @@
 #include "mbnet/cookies/WebCookieJarCurlImpl.h"
 #include "services/network/public/cpp/resource_request_body.h"
 #include "third_party/blink/public/platform/platform.h"
+#include "third_party/blink/public/platform/web_security_origin.h"
 #include "third_party/blink/public/platform/web_url_request.h"
 #include "third_party/blink/public/web/web_document.h"
 #include "third_party/blink/public/web/web_element.h"
@@ -96,12 +97,17 @@ WebPluginImpl::WebPluginImpl(blink::WebLocalFrame* parentFrame, const blink::Web
     if (!m_webFrame)
         return;
 
+    memset(&m_npWindow, 0, sizeof(m_npWindow));
     findVirtualPluginByMime();
 
     if (!m_plugin)
         m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
     if (!m_plugin && PluginDatabase::installedPlugins()->refresh())
         m_plugin = PluginDatabase::installedPlugins()->findPlugin(m_url, m_mimeType);
+
+    // Always capture initial HTML attributes so late plugin resolution in Initialize()
+    // (e.g. <object> with <param name="movie"> and no data attribute) preserves all attributes.
+    setParameters(params.attribute_names, params.attribute_values);
 
     if (!m_plugin) {
         m_status = PluginStatusCanNotFindPlugin;
@@ -112,9 +118,6 @@ WebPluginImpl::WebPluginImpl(blink::WebLocalFrame* parentFrame, const blink::Web
     m_instance->ndata = this;
     m_instance->pdata = nullptr;
     instanceMap()[m_instance] = this;
-
-    memset(&m_npWindow, 0, sizeof(m_npWindow));
-    setParameters(params.attribute_names, params.attribute_values);
 }
 
 WebPluginImpl::~WebPluginImpl()
@@ -248,6 +251,19 @@ bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
             }
 
             if (foundChildParam) {
+                if (!urlFromParam.empty()) {
+                    bool hasSrc = false;
+                    for (const auto& existingName : mergedNames) {
+                        if (base::EqualsCaseInsensitiveASCII(existingName.Utf8(), "src")) {
+                            hasSrc = true;
+                            break;
+                        }
+                    }
+                    if (!hasSrc) {
+                        mergedNames.push_back(blink::WebString::FromASCII("src"));
+                        mergedValues.push_back(blink::WebString::FromUTF8(urlFromParam));
+                    }
+                }
                 freeStringArray(m_paramNames, m_paramCount);
                 freeStringArray(m_paramValues, m_paramCount);
                 m_paramNames = nullptr;
@@ -666,6 +682,17 @@ NPError WebPluginImpl::getValue(NPNVariable variable, void* value)
     case NPNVprivateModeBool:
         *static_cast<NPBool*>(value) = FALSE;
         return NPERR_NO_ERROR;
+    case NPNVdocumentOrigin: {
+        if (!m_webFrame)
+            return NPERR_GENERIC_ERROR;
+        std::string origin = m_webFrame->GetSecurityOrigin().ToString().Utf8();
+        char* originCopy = static_cast<char*>(NPN_MemAlloc(static_cast<uint32_t>(origin.size() + 1)));
+        if (!originCopy)
+            return NPERR_OUT_OF_MEMORY_ERROR;
+        memcpy(originCopy, origin.data(), origin.size() + 1);
+        *static_cast<char**>(value) = originCopy;
+        return NPERR_NO_ERROR;
+    }
     default:
         return NPERR_GENERIC_ERROR;
     }

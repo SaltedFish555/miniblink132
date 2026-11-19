@@ -210,7 +210,7 @@ bool PluginDatabase::refresh()
         if (shouldSkipUnchangedFiles && timeIt != m_pluginPathsWithTimes.end() && timeIt->second == lastModified)
             continue;
 
-        auto oldIt = m_pluginsByPath.find(path);
+        auto oldIt = m_pluginsByPath.find(base::ToLowerASCII(path));
         if (oldIt != m_pluginsByPath.end())
             remove(oldIt->second.get());
 
@@ -366,11 +366,21 @@ bool PluginDatabase::add(scoped_refptr<PluginPackage> package)
 {
     if (!package)
         return false;
-    for (const auto& existing : m_plugins) {
-        if (PluginPackage::equal(*existing, *package))
-            return false;
+    if (package->isVirtual()) {
+        for (const auto& existing : m_plugins) {
+            if (existing->isVirtual() && PluginPackage::equal(*existing, *package))
+                return false;
+        }
+        m_plugins.push_back(std::move(package));
+        return true;
     }
-    m_pluginsByPath[package->path().Utf8()] = package;
+
+    // Deduplicate by canonical path so preferred app-directory plugins are not discarded
+    // when a system directory plugin with the same normalized name/description sorts earlier.
+    std::string pathKey = base::ToLowerASCII(package->path().Utf8());
+    if (m_pluginsByPath.find(pathKey) != m_pluginsByPath.end())
+        return false;
+    m_pluginsByPath[pathKey] = package;
     m_plugins.push_back(std::move(package));
     return true;
 }
@@ -382,7 +392,8 @@ void PluginDatabase::remove(PluginPackage* package)
         if (it != m_preferredPlugins.end() && it->second.get() == package)
             m_preferredPlugins.erase(it);
     }
-    m_pluginsByPath.erase(package->path().Utf8());
+    if (!package->isVirtual())
+        m_pluginsByPath.erase(base::ToLowerASCII(package->path().Utf8()));
     m_plugins.erase(std::remove_if(m_plugins.begin(), m_plugins.end(),
                         [package](const scoped_refptr<PluginPackage>& p) { return p.get() == package; }),
         m_plugins.end());
