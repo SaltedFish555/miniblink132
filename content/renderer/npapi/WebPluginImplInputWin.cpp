@@ -3,6 +3,9 @@
 
 #include "content/renderer/npapi/WebPluginImpl.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include "base/strings/utf_string_conversions.h"
 #include "content/renderer/npapi/WebPluginImeWin.h"
 #include "third_party/blink/public/common/input/web_coalesced_input_event.h"
@@ -20,6 +23,7 @@ void WebPluginImpl::UpdateFocus(bool focused, blink::mojom::FocusType)
         return;
 
 #if defined(_WIN32)
+    scoped_refptr<WebPluginImpl> protect(this);
     NPEvent focusEvent {};
     focusEvent.event = focused ? WM_SETFOCUS : WM_KILLFOCUS;
     focusEvent.wParam = 0;
@@ -38,14 +42,15 @@ bool WebPluginImpl::handleMouseEvent(const blink::WebInputEvent& rawEvent)
     if (!m_plugin || m_isWindowed)
         return false;
 
+    scoped_refptr<WebPluginImpl> protect(this);
     const auto& evt = static_cast<const blink::WebMouseEvent&>(rawEvent);
     NPEvent npEvent {};
 
-    // paintIntoTransformedContext positions Flash at m_windowRect (RootFrame coords),
-    // so pass mouse coordinates in RootFrame space as well.
-    gfx::PointF rootPt = evt.PositionInRootFrame();
-    int x = static_cast<int>(rootPt.x());
-    int y = static_cast<int>(rootPt.y());
+    // paintIntoTransformedContext positions windowless Flash at local (0, 0),
+    // and WebPluginContainerImpl delivers PositionInWidget() in plugin-local coordinates.
+    gfx::PointF localPt = evt.PositionInWidget();
+    int x = static_cast<int>(localPt.x());
+    int y = static_cast<int>(localPt.y());
     npEvent.lParam = MAKELPARAM(x, y);
     npEvent.wParam = 0;
 
@@ -99,8 +104,16 @@ bool WebPluginImpl::handleMouseEvent(const blink::WebInputEvent& rawEvent)
     } else if (type == blink::WebInputEvent::Type::kMouseWheel) {
         const auto& wheelEvt = static_cast<const blink::WebMouseWheelEvent&>(rawEvent);
         npEvent.event = WM_MOUSEWHEEL;
-        short wheelDelta = static_cast<short>(wheelEvt.delta_y);
-        npEvent.wParam = MAKEWPARAM( LOWORD(npEvent.wParam), wheelDelta );
+        int wheelDeltaInt = 0;
+        if (wheelEvt.wheel_ticks_y != 0.0f) {
+            wheelDeltaInt = static_cast<int>(std::lround(wheelEvt.wheel_ticks_y * WHEEL_DELTA));
+        } else if (wheelEvt.delta_y != 0.0f) {
+            wheelDeltaInt = (wheelEvt.delta_y > 0.0f)
+                ? std::max<int>(WHEEL_DELTA, static_cast<int>(std::lround(wheelEvt.delta_y)))
+                : std::min<int>(-WHEEL_DELTA, static_cast<int>(std::lround(wheelEvt.delta_y)));
+        }
+        short wheelDelta = static_cast<short>(std::clamp(wheelDeltaInt, -32768, 32767));
+        npEvent.wParam = MAKEWPARAM(LOWORD(npEvent.wParam), static_cast<WORD>(wheelDelta));
     } else {
         return false;
     }
@@ -144,9 +157,34 @@ bool WebPluginImpl::handleKeyboardEvent(const blink::WebKeyboardEvent& evt)
     if (!m_plugin || m_isWindowed)
         return false;
 
+    scoped_refptr<WebPluginImpl> protect(this);
     if (!m_pluginIme && m_plugin->quirks().contains(PluginQuirkEmulateIme))
         m_pluginIme = std::make_unique<WebPluginIMEWin>();
     WebPluginIMEWin::ScopedLock lock(m_pluginIme.get());
+
+    UINT scanCode = ::MapVirtualKeyW(static_cast<UINT>(evt.windows_key_code), MAPVK_VK_TO_VSC) & 0xFF;
+    uintptr_t baseLParam = 1u | (static_cast<uintptr_t>(scanCode) << 16);
+    if (evt.GetModifiers() & blink::WebInputEvent::kIsKeyPad)
+        baseLParam |= (1u << 24);
+    switch (evt.windows_key_code) {
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_RCONTROL:
+    case VK_RMENU:
+    case VK_DIVIDE:
+        baseLParam |= (1u << 24);
+        break;
+    default:
+        break;
+    }
 
     NPEvent npEvent {};
     npEvent.wParam = evt.windows_key_code;
@@ -154,7 +192,9 @@ bool WebPluginImpl::handleKeyboardEvent(const blink::WebKeyboardEvent& evt)
     blink::WebInputEvent::Type type = evt.GetType();
     if (type == blink::WebInputEvent::Type::kRawKeyDown || type == blink::WebInputEvent::Type::kKeyDown) {
         npEvent.event = WM_KEYDOWN;
-        npEvent.lParam = 0;
+        npEvent.lParam = baseLParam;
+        if (evt.GetModifiers() & blink::WebInputEvent::kIsAutoRepeat)
+            npEvent.lParam |= (1u << 30);
     } else if (type == blink::WebInputEvent::Type::kChar) {
         int charCode = evt.text[0] ? evt.text[0] : evt.windows_key_code;
         if (m_plugin->quirks().contains(PluginQuirkEmulateIme) && charCode > 0x7F) {
@@ -162,12 +202,12 @@ bool WebPluginImpl::handleKeyboardEvent(const blink::WebKeyboardEvent& evt)
         }
         npEvent.event = WM_CHAR;
         npEvent.wParam = charCode;
-        npEvent.lParam = 1;
+        npEvent.lParam = baseLParam;
         dispatchNPEvent(npEvent);
         return true;
     } else if (type == blink::WebInputEvent::Type::kKeyUp) {
         npEvent.event = WM_KEYUP;
-        npEvent.lParam = 0x8000;
+        npEvent.lParam = baseLParam | 0xC0000000u;
     } else {
         return false;
     }

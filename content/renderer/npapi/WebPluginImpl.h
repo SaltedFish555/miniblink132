@@ -123,6 +123,7 @@ public:
     bool handleKeyboardCharEventForEmulateIme(int windowsKeyCode);
     bool getImeStatus(int* inputType, gfx::Rect* caretRect);
 
+    bool isStarted() const { return m_isStarted; }
     WNDPROC pluginWndProc() const { return m_pluginWndProc; }
     static LRESULT CALLBACK PluginViewWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT wndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);

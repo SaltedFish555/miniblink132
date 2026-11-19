@@ -1267,7 +1267,7 @@ blink::WebPlugin* WebLocalFrameClientImpl::CreatePlugin(const blink::WebPluginPa
             hasWmode = true;
             std::string val = params.attribute_values[i].Utf8();
             if (!base::EqualsCaseInsensitiveASCII(val, "opaque") && !base::EqualsCaseInsensitiveASCII(val, "transparent")) {
-                attrValues.push_back(blink::WebString::FromASCII("transparent"));
+                attrValues.push_back(blink::WebString::FromASCII("opaque"));
             } else {
                 attrValues.push_back(params.attribute_values[i]);
             }
@@ -1277,7 +1277,7 @@ blink::WebPlugin* WebLocalFrameClientImpl::CreatePlugin(const blink::WebPluginPa
     }
     if (!hasWmode) {
         attrNames.push_back(blink::WebString::FromASCII("wmode"));
-        attrValues.push_back(blink::WebString::FromASCII("transparent"));
+        attrValues.push_back(blink::WebString::FromASCII("opaque"));
     }
     newParams.attribute_names = blink::WebVector<blink::WebString>(attrNames);
     newParams.attribute_values = blink::WebVector<blink::WebString>(attrValues);

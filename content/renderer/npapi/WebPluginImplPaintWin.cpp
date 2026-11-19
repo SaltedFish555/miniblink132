@@ -3,6 +3,7 @@
 
 #include "content/renderer/npapi/WebPluginImpl.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "base/functional/bind.h"
@@ -176,6 +177,7 @@ LRESULT CALLBACK WebPluginImpl::PluginViewWndProc(HWND hWnd, UINT message, WPARA
     auto* view = reinterpret_cast<WebPluginImpl*>(::GetPropW(hWnd, kWebPluginViewProperty));
     if (!view)
         return ::DefWindowProcW(hWnd, message, wParam, lParam);
+    scoped_refptr<WebPluginImpl> protect(view);
     ++view->m_pluginViewWndProcReentryCount;
     if (view->m_pluginViewWndProcReentryCount > 10) {
         --view->m_pluginViewWndProcReentryCount;
@@ -405,14 +407,30 @@ void WebPluginImpl::setNPWindowRect(const gfx::Rect& rect)
     if (!m_isStarted || !m_plugin || !m_instance)
         return;
 
-    m_npWindow.x = rect.x();
-    m_npWindow.y = rect.y();
-    m_npWindow.width = rect.width();
-    m_npWindow.height = rect.height();
-    m_npWindow.clipRect.left = 0;
-    m_npWindow.clipRect.top = 0;
-    m_npWindow.clipRect.right = static_cast<uint16_t>(rect.width());
-    m_npWindow.clipRect.bottom = static_cast<uint16_t>(rect.height());
+    int w = std::max(0, rect.width());
+    int h = std::max(0, rect.height());
+
+    if (!m_isWindowed) {
+        // Windowless backing DIB always starts at local (0, 0). Keeping m_npWindow and
+        // WM_WINDOWPOSCHANGED at (0, 0) avoids port/clipRect mismatch and negative-coord underflow.
+        m_npWindow.x = 0;
+        m_npWindow.y = 0;
+        m_npWindow.width = static_cast<uint32_t>(w);
+        m_npWindow.height = static_cast<uint32_t>(h);
+        m_npWindow.clipRect.left = 0;
+        m_npWindow.clipRect.top = 0;
+        m_npWindow.clipRect.right = static_cast<uint16_t>(std::min(w, 0xFFFF));
+        m_npWindow.clipRect.bottom = static_cast<uint16_t>(std::min(h, 0xFFFF));
+    } else {
+        m_npWindow.x = rect.x();
+        m_npWindow.y = rect.y();
+        m_npWindow.width = static_cast<uint32_t>(w);
+        m_npWindow.height = static_cast<uint32_t>(h);
+        m_npWindow.clipRect.left = static_cast<uint16_t>(std::clamp(m_clipRect.x(), 0, 0xFFFF));
+        m_npWindow.clipRect.top = static_cast<uint16_t>(std::clamp(m_clipRect.y(), 0, 0xFFFF));
+        m_npWindow.clipRect.right = static_cast<uint16_t>(std::clamp(m_clipRect.right(), 0, 0xFFFF));
+        m_npWindow.clipRect.bottom = static_cast<uint16_t>(std::clamp(m_clipRect.bottom(), 0, 0xFFFF));
+    }
 
     if (m_plugin->pluginFuncs()->setwindow) {
         setCallingPlugin(true);
@@ -444,15 +462,15 @@ void WebPluginImpl::paintIntoTransformedContext(HDC hdc)
     m_npWindow.type = NPWindowTypeDrawable;
     m_npWindow.window = hdc;
 
-    gfx::Rect r = m_windowRect;
-    if (r.IsEmpty())
-        r = gfx::Rect(0, 0, 1, 1);
+    int w = m_windowRect.width() > 0 ? m_windowRect.width() : 1;
+    int h = m_windowRect.height() > 0 ? m_windowRect.height() : 1;
+    gfx::Rect localRect(0, 0, w, h);
 
     WINDOWPOS windowpos {};
-    windowpos.x = r.x();
-    windowpos.y = r.y();
-    windowpos.cx = r.width();
-    windowpos.cy = r.height();
+    windowpos.x = 0;
+    windowpos.y = 0;
+    windowpos.cx = w;
+    windowpos.cy = h;
 
     NPEvent npEvent {};
     npEvent.event = WM_WINDOWPOSCHANGED;
@@ -460,7 +478,7 @@ void WebPluginImpl::paintIntoTransformedContext(HDC hdc)
     npEvent.wParam = 0;
     dispatchNPEvent(npEvent);
 
-    setNPWindowRect(r);
+    setNPWindowRect(localRect);
 
     npEvent.event = WM_PAINT;
     npEvent.wParam = reinterpret_cast<uintptr_t>(hdc);
@@ -499,16 +517,7 @@ void WebPluginImpl::Paint(cc::PaintCanvas* canvas, const gfx::Rect& rect)
     }
 
 #if defined(_WIN32)
-    XFORM originalTransform {};
-    ::GetWorldTransform(m_memoryDC, &originalTransform);
-    XFORM transform = originalTransform;
-    transform.eDx = static_cast<FLOAT>(-m_windowRect.x());
-    transform.eDy = static_cast<FLOAT>(-m_windowRect.y());
-    ::SetWorldTransform(m_memoryDC, &transform);
-
     paintIntoTransformedContext(m_memoryDC);
-
-    ::SetWorldTransform(m_memoryDC, &originalTransform);
 #endif
 
     if (!m_isTransparent)
@@ -525,7 +534,8 @@ void WebPluginImpl::Paint(cc::PaintCanvas* canvas, const gfx::Rect& rect)
         .set_image(std::move(skImage), cc::PaintImage::GetNextContentId())
         .TakePaintImage();
 
-    canvas->drawImage(paintImage, static_cast<SkScalar>(m_windowRect.x()), static_cast<SkScalar>(m_windowRect.y()));
+    gfx::Point rootOrigin = m_pluginContainer->LocalToRootFramePoint(gfx::Point(0, 0));
+    canvas->drawImage(paintImage, static_cast<SkScalar>(rootOrigin.x()), static_cast<SkScalar>(rootOrigin.y()));
 }
 
 bool WebPluginImpl::platformGetValueStatic(NPNVariable, void*, NPError*)
@@ -672,6 +682,11 @@ void WebPluginImpl::platformDestroy()
     if (m_widget) {
         HWND widget = m_widget;
         m_widget = nullptr;
+        ::RemovePropW(widget, kWebPluginViewProperty);
+        if (::IsWindowUnicode(widget))
+            ::SetWindowLongPtrW(widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&destroyNullWndProc));
+        else
+            ::SetWindowLongPtrA(widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&destroyNullWndProc));
         ::ShowWindow(widget, SW_HIDE);
         base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
             FROM_HERE, base::BindOnce(&destroyPluginWindowAsync, reinterpret_cast<intptr_t>(widget)));
