@@ -29,16 +29,19 @@ public:
             : m_instance(instance)
         {
             if (m_instance)
-                m_instance->lock();
+                m_previousInstance = m_instance->lock();
         }
         ~ScopedLock()
         {
             if (m_instance)
-                m_instance->unlock();
+                m_instance->unlock(m_previousInstance);
         }
+        ScopedLock(const ScopedLock&) = delete;
+        ScopedLock& operator=(const ScopedLock&) = delete;
 
     private:
         WebPluginIMEWin* m_instance;
+        WebPluginIMEWin* m_previousInstance = nullptr;
     };
 
     WebPluginIMEWin();
@@ -52,8 +55,8 @@ public:
     static bool hookGetProcAddress(HMODULE module);
 
 private:
-    void lock();
-    void unlock();
+    WebPluginIMEWin* lock();
+    void unlock(WebPluginIMEWin* previousInstance);
 
 #if defined(_WIN32)
     static FARPROC getProcAddress(LPCSTR name);

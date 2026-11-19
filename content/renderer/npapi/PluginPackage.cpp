@@ -9,6 +9,7 @@
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
 #include "content/renderer/npapi/PluginDatabase.h"
+#include "content/renderer/npapi/WebPluginImeWin.h"
 #include "content/renderer/npapi/npruntime_priv.h"
 #include <string.h>
 #include <wchar.h>
@@ -411,6 +412,13 @@ bool PluginPackage::load()
 
     if (!m_module)
         return false;
+
+#if defined(_WIN32)
+    // Hook GetProcAddress and direct imm32.dll IAT entries BEFORE NP_Initialize
+    // so plugins that cache IMM function pointers during initialization are intercepted.
+    if (m_quirks.contains(PluginQuirkEmulateIme))
+        WebPluginIMEWin::hookGetProcAddress(m_module);
+#endif
 
     m_isLoaded = true;
 

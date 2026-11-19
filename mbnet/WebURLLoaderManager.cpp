@@ -369,7 +369,9 @@ static void parseMimeIfNeeded(WebURLLoaderManager* manager, WebURLLoaderInternal
 
     if (dataLengt > 6 && 0 == memcmp(data, "%PDF-", 5)) {
         job->m_response.SetMimeType(blink::WebString::FromUTF8("application/pdf"));
-    } else if (dataLengt >= 4 && (0 == memcmp(data, "FWS", 3) || 0 == memcmp(data, "CWS", 3) || 0 == memcmp(data, "ZWS", 3))) {
+    } else if (dataLengt >= 4
+        && (0 == memcmp(data, "FWS", 3) || 0 == memcmp(data, "CWS", 3) || 0 == memcmp(data, "ZWS", 3))
+        && static_cast<unsigned char>(data[3]) >= 1 && static_cast<unsigned char>(data[3]) <= 64) {
         job->m_response.SetMimeType(blink::WebString::FromUTF8("application/x-shockwave-flash"));
     }
 }
