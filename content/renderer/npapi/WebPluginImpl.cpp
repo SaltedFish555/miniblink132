@@ -169,7 +169,7 @@ bool WebPluginImpl::Initialize(blink::WebPluginContainer* container)
                 if (base::EqualsCaseInsensitiveASCII(nameUtf8, "wmode")) {
                     if (!base::EqualsCaseInsensitiveASCII(valUtf8, "opaque")
                         && !base::EqualsCaseInsensitiveASCII(valUtf8, "transparent")) {
-                        rawVal = blink::WebString::FromASCII("transparent");
+                        rawVal = blink::WebString::FromASCII("opaque");
                     }
                     bool updatedWmode = false;
                     for (size_t idx = 0; idx < mergedNames.size(); ++idx) {
@@ -346,6 +346,7 @@ void WebPluginImpl::stop()
     }
 
     m_isStarted = false;
+    m_messageThrottler.reset();
 
 #if defined(_WIN32)
     if (m_isWindowed && m_widget) {
@@ -353,6 +354,7 @@ void WebPluginImpl::stop()
         if (currentWndProc == PluginViewWndProc && m_pluginWndProc)
             ::SetWindowLongPtrW(m_widget, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(m_pluginWndProc));
     }
+    m_pluginWndProc = nullptr;
 #endif
 
     m_npWindow.window = nullptr;

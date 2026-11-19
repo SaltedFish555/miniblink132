@@ -59,8 +59,12 @@ void PluginMessageThrottlerWin::appendMessage(HWND hWnd, UINT msg, WPARAM wParam
 
 void PluginMessageThrottlerWin::messageThrottleTimerFired()
 {
+    if (!m_pluginView || !m_pluginView->isStarted())
+        return;
+
+    scoped_refptr<WebPluginImpl> protect(m_pluginView);
     for (unsigned i = 0; i < kMaxContinuousMessages; ++i) {
-        if (!m_front)
+        if (!m_front || !protect->isStarted())
             break;
 
         PluginMessage* message = m_front;
@@ -68,18 +72,22 @@ void PluginMessageThrottlerWin::messageThrottleTimerFired()
         if (message == m_back)
             m_back = nullptr;
 
-        scoped_refptr<WebPluginImpl> protect(m_pluginView);
-#if defined(_WIN32)
-        if (WNDPROC proc = m_pluginView->pluginWndProc())
-            ::CallWindowProcW(proc, message->hWnd, message->message, message->wParam, message->lParam);
-#endif
+        PluginMessage msgCopy = *message;
         freeMessage(message);
+
+#if defined(_WIN32)
+        if (WNDPROC proc = protect->pluginWndProc())
+            ::CallWindowProcW(proc, msgCopy.hWnd, msgCopy.message, msgCopy.wParam, msgCopy.lParam);
+#endif
+        // m_messageThrottler may have been destroyed inside CallWindowProcW -> WebPluginImpl::stop().
+        if (!protect->isStarted())
+            return;
 
         if (!m_front)
             break;
     }
 
-    if (m_front && !m_messageThrottleTimer.IsRunning()) {
+    if (m_front && protect->isStarted() && !m_messageThrottleTimer.IsRunning()) {
         m_messageThrottleTimer.Start(FROM_HERE, base::Microseconds(kMessageThrottleTimeMicroseconds),
             base::BindOnce(&PluginMessageThrottlerWin::messageThrottleTimerFired, base::Unretained(this)));
     }
